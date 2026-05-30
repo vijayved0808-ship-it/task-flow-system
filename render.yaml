@@ -4,7 +4,7 @@ services:
     runtime: docker
     rootDir: taskflow-api
     dockerfilePath: ./Dockerfile
-    plan: free
+    plan: starter
     envVars:
       - key: APP_ENV
         value: production
@@ -51,7 +51,6 @@ services:
     rootDir: taskflow-dashboard
     buildCommand: npm install && npm run build
     staticPublishPath: dist
-    plan: free
     envVars:
       - key: VITE_API_URL
         value: https://taskflow-api.onrender.com
