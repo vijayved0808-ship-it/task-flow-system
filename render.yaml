@@ -1,0 +1,64 @@
+services:
+  - type: web
+    name: taskflow-api
+    runtime: php
+    rootDir: taskflow-api
+    buildCommand: composer install --no-dev --optimize-autoloader && php artisan config:cache && php artisan route:cache
+    startCommand: php artisan serve --host=0.0.0.0 --port=$PORT
+    plan: free
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: APP_DEBUG
+        value: "false"
+      - key: APP_KEY
+        generateValue: true
+      - key: DB_CONNECTION
+        value: pgsql
+      - key: DB_HOST
+        fromDatabase:
+          name: taskflow-db
+          property: host
+      - key: DB_PORT
+        fromDatabase:
+          name: taskflow-db
+          property: port
+      - key: DB_DATABASE
+        fromDatabase:
+          name: taskflow-db
+          property: database
+      - key: DB_USERNAME
+        fromDatabase:
+          name: taskflow-db
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: taskflow-db
+          property: password
+      - key: CACHE_DRIVER
+        value: database
+      - key: QUEUE_CONNECTION
+        value: database
+      - key: SESSION_DRIVER
+        value: database
+      - key: WHATSAPP_VERIFY_TOKEN
+        value: taskflow-secret-123
+      - key: FRONTEND_URL
+        value: https://taskflow-dashboard.onrender.com
+
+  - type: web
+    name: taskflow-dashboard
+    runtime: static
+    rootDir: taskflow-dashboard
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    plan: free
+    envVars:
+      - key: VITE_API_URL
+        value: https://taskflow-api.onrender.com
+
+databases:
+  - name: taskflow-db
+    databaseName: taskflow
+    user: taskflow
+    plan: free
