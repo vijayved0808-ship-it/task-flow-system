@@ -13,7 +13,7 @@ class TaskController extends Controller
 
     public function index(Request $request)
     {
-        $tasks = Task::with(['assignedTo', 'assignedBy'])
+        $tasks = Task::with(['assignedTo:id,name,phone,designation', 'assignedBy:id,name'])
             ->when($request->status, fn($q, $s) => $q->where('status', $s))
             ->when($request->priority, fn($q, $p) => $q->where('priority', $p))
             ->when($request->assigned_to, fn($q, $u) => $q->where('assigned_to', $u))
@@ -26,24 +26,24 @@ class TaskController extends Controller
     public function store(Request $request)
     {
         $data = $request->validate([
-            'title'       => 'required|string|max:500',
-            'description' => 'nullable|string',
-            'assigned_to' => 'nullable|uuid|exists:users,id',
-            'team_id'     => 'nullable|uuid|exists:teams,id',
-            'priority'    => 'in:low,medium,high,critical',
-            'due_date'    => 'nullable|date',
+            'title'         => 'required|string|max:500',
+            'description'   => 'nullable|string',
+            'assigned_to'   => 'nullable|uuid|exists:users,id',
+            'team_id'       => 'nullable|uuid|exists:teams,id',
+            'priority'      => 'in:low,medium,high,critical',
+            'due_date'      => 'nullable|date',
             'reward_points' => 'integer|min:0|max:500',
         ]);
 
         $data['assigned_by'] = $request->user()->id;
         $task = $this->taskService->create($data);
 
-        return response()->json($task, 201);
+        return response()->json($task->load('assignedTo'), 201);
     }
 
     public function show(Task $task)
     {
-        return response()->json($task->load(['assignedTo', 'assignedBy', 'updates']));
+        return response()->json($task->load(['assignedTo', 'assignedBy', 'updates.user']));
     }
 
     public function update(Request $request, Task $task)
@@ -70,11 +70,11 @@ class TaskController extends Controller
     {
         $request->validate(['status' => 'required|in:assigned,accepted,in_progress,waiting,completed,verified,rejected,escalated']);
         $this->taskService->updateStatus($task, $request->status, $request->user());
-        return response()->json($task->fresh());
+        return response()->json($task->fresh()->load('assignedTo'));
     }
 
     public function updates(Task $task)
     {
-        return response()->json($task->updates()->with('user')->latest()->get());
+        return response()->json($task->updates()->with('user:id,name')->latest()->get());
     }
 }
