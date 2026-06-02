@@ -11,81 +11,90 @@ class WhatsAppService
     private string $apiUrl;
     private string $token;
     private string $phoneNumberId;
+    private bool $enabled;
 
     public function __construct()
     {
-        $this->token         = config('services.whatsapp.token');
-        $this->phoneNumberId = config('services.whatsapp.phone_number_id');
-        $this->apiUrl        = 'https://graph.facebook.com/' . config('services.whatsapp.api_version', 'v19.0');
+        $this->token = config('services.whatsapp.token') ?? env('WHATSAPP_TOKEN') ?? '';
+        $this->phoneNumberId = config('services.whatsapp.phone_number_id') ?? env('WHATSAPP_PHONE_NUMBER_ID') ?? '';
+        $this->apiUrl = "https://graph.facebook.com/v21.0/{$this->phoneNumberId}/messages";
+        
+        // Disable WhatsApp if token/phone_id not configured
+        $this->enabled = !empty($this->token) && !empty($this->phoneNumberId);
+        
+        if (!$this->enabled) {
+            Log::warning('WhatsApp service disabled - missing token or phone_number_id');
+        }
     }
 
-    public function sendMessage(string $phone, string $message): bool
+    public function sendMessage(string $to, string $message): bool
     {
-        try {
-            $response = Http::withToken($this->token)
-                ->post("{$this->apiUrl}/{$this->phoneNumberId}/messages", [
-                    'messaging_product' => 'whatsapp',
-                    'to'                => $this->normalizePhone($phone),
-                    'type'              => 'text',
-                    'text'              => ['body' => $message],
-                ]);
+        if (!$this->enabled) {
+            Log::info('WhatsApp message skipped (service disabled)', ['to' => $to, 'message' => substr($message, 0, 50)]);
+            return false;
+        }
 
-            if (!$response->successful()) {
-                Log::error('WhatsApp send failed', ['response' => $response->json(), 'phone' => $phone]);
+        try {
+            // Clean phone number (remove + and spaces)
+            $cleanPhone = preg_replace('/[^\d]/', '', $to);
+            
+            $response = Http::withHeaders([
+                'Authorization' => 'Bearer ' . $this->token,
+                'Content-Type'  => 'application/json',
+            ])->post($this->apiUrl, [
+                'messaging_product' => 'whatsapp',
+                'to'                => $cleanPhone,
+                'type'              => 'text',
+                'text'              => [
+                    'preview_url' => false,
+                    'body'        => $message,
+                ],
+            ]);
+
+            if ($response->successful()) {
+                Log::info('WhatsApp sent', ['to' => $cleanPhone]);
+                return true;
+            } else {
+                Log::warning('WhatsApp send failed', [
+                    'to' => $cleanPhone,
+                    'status' => $response->status(),
+                    'body' => $response->body()
+                ]);
                 return false;
             }
-            return true;
         } catch (\Exception $e) {
             Log::error('WhatsApp exception', ['error' => $e->getMessage()]);
             return false;
         }
     }
 
-    public function sendTaskAssignment(Task $task): void
+    public function sendTaskAssignment(Task $task): bool
     {
-        $employee = $task->assignedTo;
-        $priority = strtoupper($task->priority);
-        $due      = $task->due_date ? $task->due_date->format('D, d M Y h:i A') : 'No deadline';
-
-        $msg = "Hello {$employee->name} 👋\n\n"
-             . "📋 *New Task Assigned*\n"
-             . "Task: {$task->title}\n"
-             . "Priority: {$priority}\n"
-             . "Due: {$due}\n"
-             . "Points: ⭐ {$task->reward_points}\n\n";
-
-        if ($task->description) {
-            $msg .= "{$task->description}\n\n";
+        if (!$task->assignedTo || !$task->assignedTo->phone) {
+            return false;
         }
 
-        $msg .= "Reply with:\n"
-              . "*START* – Begin working\n"
-              . "*HELP* – View all commands";
+        $dueDate = $task->due_date 
+            ? $task->due_date->format('d M, h:i A') 
+            : 'No deadline';
 
-        $this->sendMessage($employee->phone, $msg);
+        $assignedBy = $task->assignedBy?->name ?? 'Admin';
+
+        $message = "👋 *New Task Assigned*\n\n"
+            . "📋 *Task:* {$task->title}\n"
+            . "👤 *From:* {$assignedBy}\n"
+            . "🆔 *ID:* T-" . substr($task->id, 0, 6) . "\n"
+            . "📅 *Due:* {$dueDate}\n"
+            . "⚡ *Priority:* " . ucfirst($task->priority) . "\n"
+            . "⭐ *Points:* {$task->reward_points}\n\n"
+            . "Reply *START* to begin\n"
+            . "Reply *HELP* for all commands";
+
+        return $this->sendMessage($task->assignedTo->phone, $message);
     }
 
-    public function sendTaskCompletedNotification(Task $task): void
+    public function isEnabled(): bool
     {
-        $manager = $task->assignedBy;
-        if (!$manager || !$manager->phone) return;
-
-        $msg = "✅ *Task Completed*\n\n"
-             . "Employee: {$task->assignedTo->name}\n"
-             . "Task: {$task->title}\n"
-             . "Completed: " . now()->format('d M, h:i A') . "\n\n"
-             . "Please verify and rate the work.";
-
-        $this->sendMessage($manager->phone, $msg);
-    }
-
-    public function sendToEmployee(string $phone, string $message): void
-    {
-        $this->sendMessage($phone, $message);
-    }
-
-    private function normalizePhone(string $phone): string
-    {
-        return preg_replace('/[^0-9]/', '', $phone);
+        return $this->enabled;
     }
 }
