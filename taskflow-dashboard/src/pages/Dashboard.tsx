@@ -108,7 +108,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadData();
-    const interval = setInterval(loadData, 30000); // Auto-refresh every 30s
+    const interval = setInterval(loadData, 30000);
     return () => clearInterval(interval);
   }, []);
 
@@ -144,8 +144,6 @@ export default function Dashboard() {
     <>
       <style dangerouslySetInnerHTML={{ __html: css }} />
       <div style={{ display: "flex", height: "100vh", overflow: "hidden", fontFamily: "'Inter', sans-serif" }}>
-
-        {/* Sidebar */}
         <aside style={{
           width: 220, background: "#0e1420", borderRight: "1px solid rgba(255,255,255,0.06)",
           display: "flex", flexDirection: "column", flexShrink: 0,
@@ -164,7 +162,6 @@ export default function Dashboard() {
               </div>
             </div>
           </div>
-
           <nav style={{ padding: "8px", flex: 1 }}>
             {[
               { id: "overview" as const,  icon: "⊞", label: "Overview" },
@@ -184,7 +181,6 @@ export default function Dashboard() {
               </button>
             ))}
           </nav>
-
           <div style={{ padding: 12, borderTop: "1px solid rgba(255,255,255,0.06)" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
               <div style={{
@@ -204,7 +200,6 @@ export default function Dashboard() {
           </div>
         </aside>
 
-        {/* Main */}
         <main style={{ flex: 1, overflow: "auto", background: "#080c14" }}>
           <header style={{
             padding: "14px 24px", borderBottom: "1px solid rgba(255,255,255,0.06)",
@@ -239,7 +234,6 @@ export default function Dashboard() {
               </div>
             )}
 
-            {/* Overview */}
             {activeView === "overview" && overview && (
               <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12 }}>
@@ -255,24 +249,6 @@ export default function Dashboard() {
                     }}>
                       <div style={{ fontSize: 10, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>{kpi.label}</div>
                       <div style={{ fontSize: 28, fontWeight: 800, color: kpi.color, fontFamily: "'Syne', sans-serif", marginTop: 6 }}>{kpi.value}</div>
-                    </div>
-                  ))}
-                </div>
-
-                <div style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 20 }}>
-                  <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1, marginBottom: 14 }}>Top Performers (7-day)</div>
-                  {leaderboard.length === 0 ? (
-                    <div style={{ textAlign: "center", padding: 30, color: "rgba(226,232,240,0.4)", fontSize: 13 }}>
-                      No data yet. Tasks will appear here as employees complete them.
-                    </div>
-                  ) : leaderboard.slice(0, 5).map((emp) => (
-                    <div key={emp.id} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
-                      <span style={{ fontSize: 10, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", width: 18 }}>#{emp.rank}</span>
-                      <div style={{ width: 26, height: 26, borderRadius: "50%", background: "rgba(34,211,238,0.2)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#22d3ee" }}>
-                        {emp.name.charAt(0)}
-                      </div>
-                      <div style={{ flex: 1 }}>{emp.name}</div>
-                      <span style={{ fontSize: 12, fontFamily: "'DM Mono', monospace", color: "#22d3ee" }}>{emp.avg_score}</span>
                     </div>
                   ))}
                 </div>
@@ -295,7 +271,6 @@ export default function Dashboard() {
               </div>
             )}
 
-            {/* Tasks */}
             {activeView === "tasks" && (
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                 {tasks.length === 0 ? (
@@ -333,7 +308,6 @@ export default function Dashboard() {
               </div>
             )}
 
-            {/* Employees */}
             {activeView === "employees" && (
               <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14 }}>
                 {employees.length === 0 ? (
@@ -363,11 +337,6 @@ export default function Dashboard() {
                       <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: 10, background: emp.is_active ? "rgba(16,185,129,0.15)" : "rgba(100,116,139,0.15)", color: emp.is_active ? "#10b981" : "#64748b", fontFamily: "'DM Mono', monospace" }}>
                         {emp.is_active ? "Active" : "Inactive"}
                       </span>
-                      {emp.department && (
-                        <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: 10, background: "rgba(255,255,255,0.05)", color: "rgba(226,232,240,0.6)", fontFamily: "'DM Mono', monospace" }}>
-                          {emp.department}
-                        </span>
-                      )}
                     </div>
                   </div>
                 ))}
@@ -377,7 +346,6 @@ export default function Dashboard() {
         </main>
       </div>
 
-      {/* Add Employee Modal */}
       {showAddEmployee && (
         <AddEmployeeModal
           onClose={() => setShowAddEmployee(false)}
@@ -385,7 +353,6 @@ export default function Dashboard() {
         />
       )}
 
-      {/* New Task Modal */}
       {showNewTask && (
         <NewTaskModal
           employees={employees}
@@ -394,7 +361,6 @@ export default function Dashboard() {
         />
       )}
 
-      {/* Notification */}
       {notification && (
         <div style={{
           position: "fixed", bottom: 24, right: 24, zIndex: 200,
@@ -409,7 +375,7 @@ export default function Dashboard() {
 
 function AddEmployeeModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
   const [name, setName] = useState("");
-  const [phone, setPhone] = useState("+91");
+  const [phone, setPhone] = useState("");
   const [designation, setDesignation] = useState("");
   const [email, setEmail] = useState("");
   const [saving, setSaving] = useState(false);
@@ -417,16 +383,58 @@ function AddEmployeeModal({ onClose, onSuccess }: { onClose: () => void; onSucce
 
   const handleSubmit = async () => {
     setError("");
+    
+    // Client-side validation
+    if (!name.trim()) {
+      setError("Name is required");
+      return;
+    }
+    if (!phone.trim()) {
+      setError("Phone is required");
+      return;
+    }
+    
+    // Clean phone number
+    let cleanPhone = phone.replace(/[\s\-()]/g, '');
+    if (!cleanPhone.startsWith('+')) {
+      if (cleanPhone.length === 10) {
+        cleanPhone = '+91' + cleanPhone;
+      } else if (cleanPhone.startsWith('91') && cleanPhone.length === 12) {
+        cleanPhone = '+' + cleanPhone;
+      }
+    }
+    
     setSaving(true);
     try {
-      await api.post("/users", {
-        name, phone, designation, email: email || `${name.toLowerCase().replace(/\s/g, '.')}@uicgroup.com`,
+      const payload: any = {
+        name: name.trim(),
+        phone: cleanPhone,
         role: "employee",
-      });
+      };
+      if (designation.trim()) payload.designation = designation.trim();
+      if (email.trim()) payload.email = email.trim();
+      
+      console.log("Sending payload:", payload);
+      const response = await api.post("/users", payload);
+      console.log("Success:", response.data);
       onSuccess();
       onClose();
     } catch (err: any) {
-      setError(err.response?.data?.message || "Failed to add employee");
+      console.error("Error response:", err.response?.data);
+      
+      // Extract detailed error from server
+      let errorMsg = "Failed to add employee";
+      
+      if (err.response?.data?.message) {
+        errorMsg = err.response.data.message;
+      } else if (err.response?.data?.errors) {
+        const firstError = Object.values(err.response.data.errors)[0];
+        errorMsg = Array.isArray(firstError) ? firstError[0] : String(firstError);
+      } else if (err.message) {
+        errorMsg = err.message;
+      }
+      
+      setError(errorMsg);
     } finally {
       setSaving(false);
     }
@@ -439,10 +447,10 @@ function AddEmployeeModal({ onClose, onSuccess }: { onClose: () => void; onSucce
         <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", marginBottom: 20 }}>They'll receive welcome message on WhatsApp</div>
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           <input placeholder="Full Name" value={name} onChange={(e) => setName(e.target.value)} />
-          <input placeholder="Phone (e.g. +919876543210)" value={phone} onChange={(e) => setPhone(e.target.value)} />
+          <input placeholder="Phone (e.g. 9876543210 or +919876543210)" value={phone} onChange={(e) => setPhone(e.target.value)} />
           <input placeholder="Designation (e.g. Field Executive)" value={designation} onChange={(e) => setDesignation(e.target.value)} />
-          <input placeholder="Email (optional)" value={email} onChange={(e) => setEmail(e.target.value)} />
-          {error && <div style={{ fontSize: 12, color: "#ef4444", padding: "6px 10px", background: "rgba(239,68,68,0.1)", borderRadius: 6 }}>{error}</div>}
+          <input placeholder="Email (optional - auto-generated if blank)" value={email} onChange={(e) => setEmail(e.target.value)} />
+          {error && <div style={{ fontSize: 12, color: "#ef4444", padding: "8px 12px", background: "rgba(239,68,68,0.1)", borderRadius: 6, border: "1px solid rgba(239,68,68,0.3)" }}>⚠️ {error}</div>}
           <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
             <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onClose}>Cancel</button>
             <button className="btn btn-primary" style={{ flex: 2 }} onClick={handleSubmit} disabled={saving || !name || !phone}>
@@ -462,8 +470,10 @@ function NewTaskModal({ employees, onClose, onSuccess }: { employees: User[]; on
   const [dueDate, setDueDate] = useState("");
   const [points, setPoints] = useState(50);
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
 
   const handleSubmit = async () => {
+    setError("");
     setSaving(true);
     try {
       await api.post("/tasks", {
@@ -472,8 +482,8 @@ function NewTaskModal({ employees, onClose, onSuccess }: { employees: User[]; on
       });
       onSuccess();
       onClose();
-    } catch (err) {
-      console.error(err);
+    } catch (err: any) {
+      setError(err.response?.data?.message || "Failed to create task");
     } finally {
       setSaving(false);
     }
@@ -500,6 +510,7 @@ function NewTaskModal({ employees, onClose, onSuccess }: { employees: User[]; on
             <input type="number" value={points} onChange={(e) => setPoints(parseInt(e.target.value) || 50)} placeholder="Points" />
           </div>
           <input type="datetime-local" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
+          {error && <div style={{ fontSize: 12, color: "#ef4444", padding: "8px 12px", background: "rgba(239,68,68,0.1)", borderRadius: 6 }}>⚠️ {error}</div>}
           <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
             <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onClose}>Cancel</button>
             <button className="btn btn-primary" style={{ flex: 2 }} onClick={handleSubmit} disabled={saving || !title || !assignedTo}>
