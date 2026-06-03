@@ -1,5 +1,4 @@
 <?php
-
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\TaskController;
@@ -8,6 +7,7 @@ use App\Http\Controllers\Api\TeamController;
 use App\Http\Controllers\Api\AnalyticsController;
 use App\Http\Controllers\Api\AIController;
 use App\Http\Controllers\Api\WebhookController;
+use App\Http\Controllers\Api\LogsController;
 
 Route::get('/health', function () {
     try { \DB::connection()->getPdo(); $db = 'connected'; }
@@ -27,18 +27,26 @@ Route::middleware(['auth:sanctum', 'throttle:300,1'])->group(function () {
     Route::apiResource('tasks', TaskController::class);
     Route::put('tasks/{task}/status', [TaskController::class, 'updateStatus']);
     Route::get('tasks/{task}/updates', [TaskController::class, 'updates']);
+
     Route::apiResource('users', UserController::class);
     Route::get('users/{user}/tasks', [UserController::class, 'tasks']);
     Route::get('users/{user}/scores', [UserController::class, 'scores']);
+
     Route::apiResource('teams', TeamController::class);
     Route::post('teams/{team}/members', [TeamController::class, 'addMember']);
+
     Route::prefix('analytics')->group(function () {
         Route::get('/overview', [AnalyticsController::class, 'overview']);
         Route::get('/leaderboard', [AnalyticsController::class, 'leaderboard']);
         Route::get('/apix/{user}', [AnalyticsController::class, 'apix']);
     });
+
     Route::prefix('ai')->group(function () {
         Route::get('/insights', [AIController::class, 'insights']);
         Route::get('/reports/{type}', [AIController::class, 'report']);
     });
+
+    // Activity logs (for debug/monitoring)
+    Route::get('/logs', [LogsController::class, 'index']);
+    Route::delete('/logs', [LogsController::class, 'destroy']);
 });
