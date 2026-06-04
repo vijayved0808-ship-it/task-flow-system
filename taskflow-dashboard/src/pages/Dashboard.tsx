@@ -37,6 +37,17 @@ interface Task {
   created_at: string;
 }
 
+interface ActivityLogEntry {
+  id: string;
+  type: string;
+  action: string;
+  status: string;
+  message: string;
+  meta?: any;
+  phone?: string;
+  created_at: string;
+}
+
 const STATUS_CONFIG: Record<string, { label: string; color: string; bg: string }> = {
   assigned:    { label: "Assigned",    color: "#64748b", bg: "rgba(100,116,139,0.12)" },
   accepted:    { label: "Accepted",    color: "#3b82f6", bg: "rgba(59,130,246,0.12)" },
@@ -54,16 +65,33 @@ const ROLE_CONFIG: Record<string, { label: string; color: string }> = {
   employee: { label: "Employee", color: "#10b981" },
 };
 
+const LOG_STATUS_COLOR = (status: string) => {
+  if (status === 'success') return '#10b981';
+  if (status === 'failed') return '#ef4444';
+  return '#f59e0b';
+};
+
+const LOG_ICON = (type: string, status: string) => {
+  if (status === 'failed') return '❌';
+  if (type === 'whatsapp_out' && status === 'success') return '✅';
+  if (type === 'whatsapp_in') return '📩';
+  if (type === 'task') return '📋';
+  if (type === 'user') return '👤';
+  return 'ℹ️';
+};
+
 export default function Dashboard() {
-  const [activeView, setActiveView] = useState<"overview" | "tasks" | "employees" | "settings">("overview");
+  const [activeView, setActiveView] = useState<"overview" | "tasks" | "employees" | "settings" | "logs">("overview");
   const [overview, setOverview] = useState<Overview | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [allUsers, setAllUsers] = useState<User[]>([]);
+  const [logs, setLogs] = useState<ActivityLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAddUser, setShowAddUser] = useState(false);
   const [showNewTask, setShowNewTask] = useState(false);
   const [editUser, setEditUser] = useState<User | null>(null);
   const [notification, setNotification] = useState<{ msg: string; type: 'success' | 'error' } | null>(null);
+  const [logsPanelOpen, setLogsPanelOpen] = useState(true);
 
   const { user, logout } = useAuthStore();
   const navigate = useNavigate();
@@ -79,14 +107,16 @@ export default function Dashboard() {
   const loadData = async () => {
     try {
       setLoading(true);
-      const [ovRes, tasksRes, usersRes] = await Promise.all([
+      const [ovRes, tasksRes, usersRes, logsRes] = await Promise.all([
         api.get("/analytics/overview").catch(() => ({ data: null })),
         api.get("/tasks").catch(() => ({ data: { data: [] } })),
         api.get("/users").catch(() => ({ data: [] })),
+        api.get("/logs").catch(() => ({ data: [] })),
       ]);
       if (ovRes.data) setOverview(ovRes.data);
       setTasks(tasksRes.data?.data || tasksRes.data || []);
       setAllUsers(usersRes.data || []);
+      setLogs(logsRes.data || []);
     } catch (err) {
       console.error("Failed to load data", err);
     } finally {
@@ -96,7 +126,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadData();
-    const interval = setInterval(loadData, 30000);
+    const interval = setInterval(loadData, 10000); // 10s for faster log updates
     return () => clearInterval(interval);
   }, []);
 
@@ -121,6 +151,27 @@ export default function Dashboard() {
     }
   };
 
+  const handleClearLogs = async () => {
+    if (!confirm("Clear all activity logs?")) return;
+    try {
+      await api.delete("/logs");
+      showNotif("Logs cleared");
+      setLogs([]);
+    } catch (err: any) {
+      showNotif("Failed to clear", 'error');
+    }
+  };
+
+  const formatTime = (iso: string) => {
+    const d = new Date(iso);
+    const now = new Date();
+    const diffSec = Math.floor((now.getTime() - d.getTime()) / 1000);
+    if (diffSec < 60) return `${diffSec}s ago`;
+    if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
+    return d.toLocaleDateString();
+  };
+
   const css = `
     @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Mono:wght@400;500&family=Inter:wght@300;400;500;600&display=swap');
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -143,6 +194,8 @@ export default function Dashboard() {
     .btn-ghost { background: rgba(255,255,255,0.06); color: #e2e8f0; border: 1px solid rgba(255,255,255,0.10); }
     .btn-danger { background: rgba(239,68,68,0.15); color: #ef4444; border: 1px solid rgba(239,68,68,0.3); }
     .btn-icon { padding: 4px 8px; font-size: 11px; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    .pulse-dot { animation: pulse 2s infinite; }
   `;
 
   return (
@@ -172,6 +225,7 @@ export default function Dashboard() {
               { id: "overview" as const,  icon: "⊞", label: "Overview" },
               { id: "tasks" as const,     icon: "✓", label: "Tasks" },
               { id: "employees" as const, icon: "◉", label: "People" },
+              { id: "logs" as const,      icon: "📊", label: "Live Logs" },
               { id: "settings" as const,  icon: "⚙", label: "Settings" },
             ].map(item => (
               <button key={item.id} onClick={() => setActiveView(item.id)} style={{
@@ -184,6 +238,9 @@ export default function Dashboard() {
               }}>
                 <span style={{ fontSize: 14, width: 18, textAlign: "center" }}>{item.icon}</span>
                 {item.label}
+                {item.id === "logs" && logs.length > 0 && (
+                  <span style={{ marginLeft: "auto", fontSize: 10, padding: "2px 6px", background: "rgba(34,211,238,0.2)", color: "#22d3ee", borderRadius: 4 }}>{logs.length}</span>
+                )}
               </button>
             ))}
           </nav>
@@ -217,10 +274,12 @@ export default function Dashboard() {
                 {activeView === "overview" && "Dashboard Overview"}
                 {activeView === "tasks" && "Task Management"}
                 {activeView === "employees" && "People Management"}
+                {activeView === "logs" && "Live Activity Logs"}
                 {activeView === "settings" && "Settings & Admin"}
               </h1>
-              <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", marginTop: 2 }}>
-                Auto-refresh every 30s
+              <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", marginTop: 2, display: "flex", alignItems: "center", gap: 6 }}>
+                <span className="pulse-dot" style={{ display: "inline-block", width: 6, height: 6, background: "#10b981", borderRadius: "50%" }}></span>
+                Live · Refresh every 10s
               </div>
             </div>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -230,6 +289,9 @@ export default function Dashboard() {
               )}
               {activeView === "tasks" && (
                 <button className="btn btn-primary" onClick={() => setShowNewTask(true)}>+ New Task</button>
+              )}
+              {activeView === "logs" && (
+                <button className="btn btn-danger" onClick={handleClearLogs}>🗑 Clear Logs</button>
               )}
             </div>
           </header>
@@ -260,18 +322,60 @@ export default function Dashboard() {
                     </div>
                   ))}
                 </div>
-                {employees.length === 0 && tasks.length === 0 && (
-                  <div style={{
-                    background: "rgba(34,211,238,0.05)", border: "1px solid rgba(34,211,238,0.2)",
-                    borderRadius: 12, padding: 24, textAlign: "center"
-                  }}>
-                    <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8, color: "#22d3ee" }}>👋 Welcome to TaskFlow!</div>
-                    <div style={{ fontSize: 13, color: "rgba(226,232,240,0.7)", lineHeight: 1.6, marginBottom: 16 }}>
-                      Add your first employee to get started.
-                    </div>
-                    <button className="btn btn-primary" onClick={() => { setActiveView("employees"); setShowAddUser(true); }}>
-                      + Add First Employee
-                    </button>
+              </div>
+            )}
+
+            {/* LOGS — Live Activity Stream */}
+            {activeView === "logs" && (
+              <div>
+                <div style={{ background: "rgba(34,211,238,0.05)", border: "1px solid rgba(34,211,238,0.2)", borderRadius: 10, padding: 14, marginBottom: 16 }}>
+                  <div style={{ fontSize: 13, color: "#22d3ee", fontWeight: 600, marginBottom: 4 }}>📊 Live System Activity</div>
+                  <div style={{ fontSize: 12, color: "rgba(226,232,240,0.7)" }}>
+                    All actions tracked live — WhatsApp sends, task creates, errors. Auto-refresh every 10s.
+                    {logs.length > 0 && ` Showing latest ${logs.length} events.`}
+                  </div>
+                </div>
+
+                {logs.length === 0 ? (
+                  <div style={{ textAlign: "center", padding: 60, color: "rgba(226,232,240,0.5)", background: "#0e1420", borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)" }}>
+                    <div style={{ fontSize: 14, marginBottom: 8 }}>No activity yet</div>
+                    <div style={{ fontSize: 12 }}>Create a task or trigger an event to see logs here</div>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {logs.map(log => {
+                      const color = LOG_STATUS_COLOR(log.status);
+                      return (
+                        <div key={log.id} style={{
+                          background: "#0e1420",
+                          borderLeft: `3px solid ${color}`,
+                          border: "1px solid rgba(255,255,255,0.06)",
+                          borderRadius: 8,
+                          padding: "12px 16px",
+                        }}>
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 4 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
+                              <span style={{ fontSize: 16 }}>{LOG_ICON(log.type, log.status)}</span>
+                              <span style={{ fontSize: 10, padding: "2px 6px", background: `${color}20`, color: color, borderRadius: 4, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{log.type}</span>
+                              <span style={{ fontSize: 10, color: "rgba(226,232,240,0.4)", fontFamily: "'DM Mono', monospace" }}>{log.action}</span>
+                            </div>
+                            <span style={{ fontSize: 10, color: "rgba(226,232,240,0.4)", fontFamily: "'DM Mono', monospace", flexShrink: 0 }}>{formatTime(log.created_at)}</span>
+                          </div>
+                          <div style={{ fontSize: 13, color: "#e2e8f0", marginLeft: 24 }}>{log.message}</div>
+                          {log.phone && (
+                            <div style={{ fontSize: 11, color: "rgba(226,232,240,0.5)", marginLeft: 24, marginTop: 2, fontFamily: "'DM Mono', monospace" }}>📱 {log.phone}</div>
+                          )}
+                          {log.meta && Object.keys(log.meta).length > 0 && (
+                            <details style={{ marginLeft: 24, marginTop: 6 }}>
+                              <summary style={{ fontSize: 10, color: "rgba(226,232,240,0.4)", cursor: "pointer", fontFamily: "'DM Mono', monospace" }}>View details</summary>
+                              <pre style={{ fontSize: 10, color: "rgba(226,232,240,0.6)", background: "rgba(0,0,0,0.3)", padding: 8, borderRadius: 4, marginTop: 4, overflow: "auto", maxHeight: 200 }}>
+                                {JSON.stringify(log.meta, null, 2)}
+                              </pre>
+                            </details>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -283,7 +387,6 @@ export default function Dashboard() {
                 {tasks.length === 0 ? (
                   <div style={{ textAlign: "center", padding: 60, color: "rgba(226,232,240,0.5)", background: "#0e1420", borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)" }}>
                     <div style={{ fontSize: 14, marginBottom: 8 }}>No tasks yet</div>
-                    <div style={{ fontSize: 12 }}>Assign tasks via WhatsApp or click "+ New Task"</div>
                   </div>
                 ) : tasks.map(task => {
                   const sc = STATUS_CONFIG[task.status] || STATUS_CONFIG.assigned;
@@ -308,10 +411,9 @@ export default function Dashboard() {
               </div>
             )}
 
-            {/* PEOPLE — Full CRUD */}
+            {/* PEOPLE */}
             {activeView === "employees" && (
               <div>
-                {/* Filter tabs */}
                 <div style={{ display: "flex", gap: 8, marginBottom: 16, padding: "0 4px" }}>
                   <div style={{ fontSize: 12, color: "rgba(226,232,240,0.5)", padding: "6px 0" }}>
                     Total: <strong style={{ color: "#22d3ee" }}>{allUsers.length}</strong> · 
@@ -319,28 +421,13 @@ export default function Dashboard() {
                     Employees: <strong style={{ color: "#10b981" }}>{employees.length}</strong>
                   </div>
                 </div>
-
                 {allUsers.length === 0 ? (
                   <div style={{ textAlign: "center", padding: 60, color: "rgba(226,232,240,0.5)", background: "#0e1420", borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)" }}>
                     <div style={{ fontSize: 14, marginBottom: 8 }}>No users yet</div>
-                    <button className="btn btn-primary" onClick={() => setShowAddUser(true)}>+ Add First User</button>
                   </div>
                 ) : (
                   <div style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, overflow: "hidden" }}>
-                    {/* Table header */}
-                    <div style={{
-                      display: "grid",
-                      gridTemplateColumns: "2fr 1.5fr 1.5fr 1fr 1fr 100px",
-                      padding: "12px 18px",
-                      gap: 12,
-                      borderBottom: "1px solid rgba(255,255,255,0.06)",
-                      background: "rgba(255,255,255,0.02)",
-                      fontSize: 10,
-                      color: "rgba(226,232,240,0.5)",
-                      fontFamily: "'DM Mono', monospace",
-                      textTransform: "uppercase",
-                      letterSpacing: 1,
-                    }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "2fr 1.5fr 1.5fr 1fr 1fr 100px", padding: "12px 18px", gap: 12, borderBottom: "1px solid rgba(255,255,255,0.06)", background: "rgba(255,255,255,0.02)", fontSize: 10, color: "rgba(226,232,240,0.5)", fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>
                       <div>Name</div>
                       <div>Phone</div>
                       <div>Designation</div>
@@ -348,42 +435,24 @@ export default function Dashboard() {
                       <div>Status</div>
                       <div style={{ textAlign: "right" }}>Actions</div>
                     </div>
-
                     {allUsers.map(u => {
                       const role = ROLE_CONFIG[u.role] || ROLE_CONFIG.employee;
                       return (
-                        <div key={u.id} style={{
-                          display: "grid",
-                          gridTemplateColumns: "2fr 1.5fr 1.5fr 1fr 1fr 100px",
-                          padding: "14px 18px",
-                          gap: 12,
-                          borderBottom: "1px solid rgba(255,255,255,0.04)",
-                          alignItems: "center",
-                          fontSize: 13,
-                        }}>
+                        <div key={u.id} style={{ display: "grid", gridTemplateColumns: "2fr 1.5fr 1.5fr 1fr 1fr 100px", padding: "14px 18px", gap: 12, borderBottom: "1px solid rgba(255,255,255,0.04)", alignItems: "center", fontSize: 13 }}>
                           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                            <div style={{
-                              width: 32, height: 32, borderRadius: "50%",
-                              background: `${role.color}20`,
-                              display: "flex", alignItems: "center", justifyContent: "center",
-                              fontSize: 12, fontWeight: 700, color: role.color, flexShrink: 0
-                            }}>{u.name.charAt(0)}</div>
+                            <div style={{ width: 32, height: 32, borderRadius: "50%", background: `${role.color}20`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, color: role.color, flexShrink: 0 }}>{u.name.charAt(0)}</div>
                             <div style={{ minWidth: 0 }}>
-                              <div style={{ fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.name}</div>
-                              <div style={{ fontSize: 10, color: "rgba(226,232,240,0.4)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.email}</div>
+                              <div style={{ fontWeight: 600 }}>{u.name}</div>
+                              <div style={{ fontSize: 10, color: "rgba(226,232,240,0.4)" }}>{u.email}</div>
                             </div>
                           </div>
                           <div style={{ fontSize: 12, fontFamily: "'DM Mono', monospace", color: "rgba(226,232,240,0.7)" }}>{u.phone}</div>
                           <div style={{ fontSize: 12, color: "rgba(226,232,240,0.7)" }}>{u.designation || '—'}</div>
                           <div>
-                            <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: 10, background: `${role.color}15`, color: role.color, fontFamily: "'DM Mono', monospace", border: `1px solid ${role.color}30` }}>
-                              {role.label}
-                            </span>
+                            <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: 10, background: `${role.color}15`, color: role.color, fontFamily: "'DM Mono', monospace", border: `1px solid ${role.color}30` }}>{role.label}</span>
                           </div>
                           <div>
-                            <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: 10, background: u.is_active ? "rgba(16,185,129,0.15)" : "rgba(100,116,139,0.15)", color: u.is_active ? "#10b981" : "#64748b", fontFamily: "'DM Mono', monospace" }}>
-                              {u.is_active ? "Active" : "Inactive"}
-                            </span>
+                            <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: 10, background: u.is_active ? "rgba(16,185,129,0.15)" : "rgba(100,116,139,0.15)", color: u.is_active ? "#10b981" : "#64748b", fontFamily: "'DM Mono', monospace" }}>{u.is_active ? "Active" : "Inactive"}</span>
                           </div>
                           <div style={{ display: "flex", gap: 4, justifyContent: "flex-end" }}>
                             <button className="btn btn-ghost btn-icon" onClick={() => setEditUser(u)} title="Edit">✎</button>
@@ -399,90 +468,101 @@ export default function Dashboard() {
               </div>
             )}
 
-            {/* SETTINGS — Admin Profile */}
+            {/* SETTINGS */}
             {activeView === "settings" && (
               <div style={{ maxWidth: 600 }}>
                 <div style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 24 }}>
                   <h2 style={{ fontFamily: "'Syne', sans-serif", fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Your Profile</h2>
-                  <div style={{ fontSize: 11, color: "rgba(226,232,240,0.4)", marginBottom: 20 }}>
-                    Update your details. Phone number is used for WhatsApp commands.
-                  </div>
+                  <div style={{ fontSize: 11, color: "rgba(226,232,240,0.4)", marginBottom: 20 }}>Update phone for WhatsApp commands</div>
                   {user && (
-                    <button
-                      className="btn btn-primary"
-                      onClick={() => {
-                        const current = allUsers.find(u => u.email === user.email);
-                        if (current) setEditUser(current);
-                      }}
-                    >
+                    <button className="btn btn-primary" onClick={() => { const current = allUsers.find(u => u.email === user.email); if (current) setEditUser(current); }}>
                       ✎ Edit My Profile
                     </button>
                   )}
-                </div>
-
-                <div style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 24, marginTop: 16 }}>
-                  <h2 style={{ fontFamily: "'Syne', sans-serif", fontSize: 16, fontWeight: 700, marginBottom: 4 }}>System Info</h2>
-                  <div style={{ fontSize: 11, color: "rgba(226,232,240,0.4)", marginBottom: 16 }}>
-                    Current system stats
-                  </div>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, fontSize: 13 }}>
-                    <div style={{ padding: 12, background: "rgba(255,255,255,0.03)", borderRadius: 8 }}>
-                      <div style={{ fontSize: 10, color: "rgba(226,232,240,0.4)", marginBottom: 4 }}>TOTAL USERS</div>
-                      <div style={{ fontSize: 20, fontWeight: 700, color: "#22d3ee", fontFamily: "'Syne', sans-serif" }}>{allUsers.length}</div>
-                    </div>
-                    <div style={{ padding: 12, background: "rgba(255,255,255,0.03)", borderRadius: 8 }}>
-                      <div style={{ fontSize: 10, color: "rgba(226,232,240,0.4)", marginBottom: 4 }}>ACTIVE USERS</div>
-                      <div style={{ fontSize: 20, fontWeight: 700, color: "#10b981", fontFamily: "'Syne', sans-serif" }}>{allUsers.filter(u => u.is_active).length}</div>
-                    </div>
-                    <div style={{ padding: 12, background: "rgba(255,255,255,0.03)", borderRadius: 8 }}>
-                      <div style={{ fontSize: 10, color: "rgba(226,232,240,0.4)", marginBottom: 4 }}>TOTAL TASKS</div>
-                      <div style={{ fontSize: 20, fontWeight: 700, color: "#f59e0b", fontFamily: "'Syne', sans-serif" }}>{tasks.length}</div>
-                    </div>
-                    <div style={{ padding: 12, background: "rgba(255,255,255,0.03)", borderRadius: 8 }}>
-                      <div style={{ fontSize: 10, color: "rgba(226,232,240,0.4)", marginBottom: 4 }}>YOUR ROLE</div>
-                      <div style={{ fontSize: 14, fontWeight: 700, color: "#22d3ee", fontFamily: "'DM Mono', monospace", marginTop: 4 }}>{user?.role?.toUpperCase()}</div>
-                    </div>
-                  </div>
                 </div>
               </div>
             )}
           </div>
         </main>
+
+        {/* Logs side panel — visible on all views except logs tab */}
+        {activeView !== "logs" && logsPanelOpen && (
+          <aside style={{
+            width: 340, background: "#0a0f18", borderLeft: "1px solid rgba(255,255,255,0.06)",
+            display: "flex", flexDirection: "column", flexShrink: 0,
+          }}>
+            <div style={{ padding: "14px 16px", borderBottom: "1px solid rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 600, fontFamily: "'Syne', sans-serif" }}>📊 Live Logs</div>
+                <div style={{ fontSize: 9, color: "rgba(226,232,240,0.4)", fontFamily: "'DM Mono', monospace", marginTop: 2, display: "flex", alignItems: "center", gap: 4 }}>
+                  <span className="pulse-dot" style={{ display: "inline-block", width: 5, height: 5, background: "#10b981", borderRadius: "50%" }}></span>
+                  Auto-refresh 10s · {logs.length} events
+                </div>
+              </div>
+              <button onClick={() => setLogsPanelOpen(false)} style={{ background: "transparent", border: "none", color: "rgba(226,232,240,0.5)", cursor: "pointer", fontSize: 16 }}>×</button>
+            </div>
+            <div style={{ flex: 1, overflow: "auto", padding: 8 }}>
+              {logs.length === 0 ? (
+                <div style={{ padding: 20, textAlign: "center", fontSize: 11, color: "rgba(226,232,240,0.4)" }}>
+                  No activity yet.<br/>Create a task to see logs.
+                </div>
+              ) : logs.slice(0, 30).map(log => {
+                const color = LOG_STATUS_COLOR(log.status);
+                return (
+                  <div key={log.id} style={{
+                    padding: "8px 10px",
+                    marginBottom: 4,
+                    borderLeft: `2px solid ${color}`,
+                    background: "rgba(255,255,255,0.02)",
+                    borderRadius: 4,
+                  }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+                      <span style={{ fontSize: 12 }}>{LOG_ICON(log.type, log.status)}</span>
+                      <span style={{ fontSize: 9, padding: "1px 5px", background: `${color}20`, color: color, borderRadius: 3, fontFamily: "'DM Mono', monospace" }}>{log.type.replace('whatsapp_', 'wa_')}</span>
+                      <span style={{ fontSize: 9, color: "rgba(226,232,240,0.4)", marginLeft: "auto", fontFamily: "'DM Mono', monospace" }}>{formatTime(log.created_at)}</span>
+                    </div>
+                    <div style={{ fontSize: 11, color: "#e2e8f0", lineHeight: 1.4 }}>{log.message}</div>
+                    {log.phone && (
+                      <div style={{ fontSize: 10, color: "rgba(226,232,240,0.4)", marginTop: 2, fontFamily: "'DM Mono', monospace" }}>{log.phone}</div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ padding: 10, borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+              <button className="btn btn-ghost" onClick={() => setActiveView("logs")} style={{ width: "100%", fontSize: 11 }}>
+                View All Logs →
+              </button>
+            </div>
+          </aside>
+        )}
+
+        {/* Reopen logs panel button */}
+        {activeView !== "logs" && !logsPanelOpen && (
+          <button
+            onClick={() => setLogsPanelOpen(true)}
+            style={{
+              position: "fixed", right: 16, top: 80, background: "#22d3ee", color: "#080c14",
+              border: "none", borderRadius: 8, padding: "8px 12px", cursor: "pointer",
+              fontSize: 12, fontWeight: 600, zIndex: 50,
+            }}
+          >
+            📊 Show Logs ({logs.length})
+          </button>
+        )}
       </div>
 
       {showAddUser && (
-        <UserModal
-          onClose={() => setShowAddUser(false)}
-          onSuccess={() => { showNotif("✅ User added! WhatsApp message sent."); loadData(); }}
-          showNotif={showNotif}
-        />
+        <UserModal onClose={() => setShowAddUser(false)} onSuccess={() => { showNotif("✅ User added!"); loadData(); }} showNotif={showNotif} />
       )}
-
       {editUser && (
-        <UserModal
-          user={editUser}
-          onClose={() => setEditUser(null)}
-          onSuccess={() => { showNotif("✅ User updated!"); loadData(); }}
-          showNotif={showNotif}
-        />
+        <UserModal user={editUser} onClose={() => setEditUser(null)} onSuccess={() => { showNotif("✅ User updated!"); loadData(); }} showNotif={showNotif} />
       )}
-
       {showNewTask && (
-        <NewTaskModal
-          employees={[...employees, ...managers]}
-          onClose={() => setShowNewTask(false)}
-          onSuccess={() => { showNotif("✅ Task assigned via WhatsApp!"); loadData(); }}
-        />
+        <NewTaskModal employees={[...employees, ...managers]} onClose={() => setShowNewTask(false)} onSuccess={() => { showNotif("✅ Task assigned!"); loadData(); }} />
       )}
-
       {notification && (
-        <div style={{
-          position: "fixed", bottom: 24, right: 24, zIndex: 200,
-          background: notification.type === 'success' ? "rgba(16,185,129,0.15)" : "rgba(239,68,68,0.15)",
-          border: notification.type === 'success' ? "1px solid rgba(16,185,129,0.3)" : "1px solid rgba(239,68,68,0.3)",
-          borderRadius: 10, padding: "12px 18px", fontSize: 13, color: "#e2e8f0",
-          backdropFilter: "blur(12px)", maxWidth: 380,
-        }}>{notification.msg}</div>
+        <div style={{ position: "fixed", bottom: 24, right: 24, zIndex: 200, background: notification.type === 'success' ? "rgba(16,185,129,0.15)" : "rgba(239,68,68,0.15)", border: notification.type === 'success' ? "1px solid rgba(16,185,129,0.3)" : "1px solid rgba(239,68,68,0.3)", borderRadius: 10, padding: "12px 18px", fontSize: 13, color: "#e2e8f0", backdropFilter: "blur(12px)", maxWidth: 380 }}>{notification.msg}</div>
       )}
     </>
   );
@@ -519,84 +599,49 @@ function UserModal({ user, onClose, onSuccess, showNotif }: { user?: User; onClo
       if (email.trim()) payload.email = email.trim();
       if (isEdit) payload.is_active = isActive;
 
-      if (isEdit) {
-        await api.put(`/users/${user!.id}`, payload);
-      } else {
-        await api.post("/users", payload);
-      }
+      if (isEdit) await api.put(`/users/${user!.id}`, payload);
+      else await api.post("/users", payload);
       onSuccess();
       onClose();
     } catch (err: any) {
-      console.error("Error:", err.response?.data);
-      let errorMsg = isEdit ? "Failed to update user" : "Failed to add user";
+      let errorMsg = isEdit ? "Failed to update" : "Failed to add";
       if (err.response?.data?.message) errorMsg = err.response.data.message;
       else if (err.response?.data?.errors) {
         const firstError = Object.values(err.response.data.errors)[0];
         errorMsg = Array.isArray(firstError) ? firstError[0] : String(firstError);
       }
       setError(errorMsg);
-    } finally {
-      setSaving(false);
-    }
+    } finally { setSaving(false); }
   };
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, backdropFilter: "blur(4px)" }} onClick={onClose}>
       <div style={{ background: "#131928", border: "1px solid rgba(255,255,255,0.10)", borderRadius: 16, padding: 28, width: 480, maxHeight: "90vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
-        <h2 style={{ fontFamily: "'Syne', sans-serif", fontSize: 18, fontWeight: 700, marginBottom: 4 }}>
-          {isEdit ? `Edit ${user.name}` : "Add User"}
-        </h2>
-        <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", marginBottom: 20 }}>
-          {isEdit ? "Update user details" : "New user will receive WhatsApp welcome message"}
-        </div>
+        <h2 style={{ fontFamily: "'Syne', sans-serif", fontSize: 18, fontWeight: 700, marginBottom: 4 }}>{isEdit ? `Edit ${user.name}` : "Add User"}</h2>
+        <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", marginBottom: 20 }}>{isEdit ? "Update user details" : "New user will receive WhatsApp welcome"}</div>
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-          <div>
-            <label style={{ fontSize: 10, color: "rgba(226,232,240,0.5)", display: "block", marginBottom: 4, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Full Name *</label>
-            <input placeholder="e.g. Priya Sharma" value={name} onChange={(e) => setName(e.target.value)} />
-          </div>
-          <div>
-            <label style={{ fontSize: 10, color: "rgba(226,232,240,0.5)", display: "block", marginBottom: 4, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Phone (WhatsApp) *</label>
-            <input placeholder="+919876543210" value={phone} onChange={(e) => setPhone(e.target.value)} />
-          </div>
+          <input placeholder="Full Name" value={name} onChange={(e) => setName(e.target.value)} />
+          <input placeholder="+919876543210" value={phone} onChange={(e) => setPhone(e.target.value)} />
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-            <div>
-              <label style={{ fontSize: 10, color: "rgba(226,232,240,0.5)", display: "block", marginBottom: 4, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Role *</label>
-              <select value={role} onChange={(e) => setRole(e.target.value)}>
-                <option value="employee">Employee</option>
-                <option value="manager">Manager</option>
-                <option value="admin">Admin</option>
-              </select>
-            </div>
+            <select value={role} onChange={(e) => setRole(e.target.value)}>
+              <option value="employee">Employee</option>
+              <option value="manager">Manager</option>
+              <option value="admin">Admin</option>
+            </select>
             {isEdit && (
-              <div>
-                <label style={{ fontSize: 10, color: "rgba(226,232,240,0.5)", display: "block", marginBottom: 4, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Status</label>
-                <select value={isActive ? "active" : "inactive"} onChange={(e) => setIsActive(e.target.value === "active")}>
-                  <option value="active">Active</option>
-                  <option value="inactive">Inactive</option>
-                </select>
-              </div>
+              <select value={isActive ? "active" : "inactive"} onChange={(e) => setIsActive(e.target.value === "active")}>
+                <option value="active">Active</option>
+                <option value="inactive">Inactive</option>
+              </select>
             )}
           </div>
-          <div>
-            <label style={{ fontSize: 10, color: "rgba(226,232,240,0.5)", display: "block", marginBottom: 4, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Designation</label>
-            <input placeholder="e.g. Field Executive" value={designation} onChange={(e) => setDesignation(e.target.value)} />
-          </div>
-          <div>
-            <label style={{ fontSize: 10, color: "rgba(226,232,240,0.5)", display: "block", marginBottom: 4, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Department</label>
-            <input placeholder="e.g. Sales" value={department} onChange={(e) => setDepartment(e.target.value)} />
-          </div>
-          <div>
-            <label style={{ fontSize: 10, color: "rgba(226,232,240,0.5)", display: "block", marginBottom: 4, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Email</label>
-            <input placeholder={isEdit ? "" : "Auto-generated if blank"} value={email} onChange={(e) => setEmail(e.target.value)} />
-          </div>
-
-          {error && <div style={{ fontSize: 12, color: "#ef4444", padding: "8px 12px", background: "rgba(239,68,68,0.1)", borderRadius: 6, border: "1px solid rgba(239,68,68,0.3)" }}>⚠️ {error}</div>}
-
-          <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+          <input placeholder="Designation" value={designation} onChange={(e) => setDesignation(e.target.value)} />
+          <input placeholder="Department" value={department} onChange={(e) => setDepartment(e.target.value)} />
+          <input placeholder="Email (optional)" value={email} onChange={(e) => setEmail(e.target.value)} />
+          {error && <div style={{ fontSize: 12, color: "#ef4444", padding: "8px 12px", background: "rgba(239,68,68,0.1)", borderRadius: 6 }}>⚠️ {error}</div>}
+          <div style={{ display: "flex", gap: 8 }}>
             <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onClose}>Cancel</button>
-            <button className="btn btn-primary" style={{ flex: 2 }} onClick={handleSubmit} disabled={saving || !name || !phone}>
-              {saving ? "Saving..." : (isEdit ? "Update User" : "Add User")}
-            </button>
+            <button className="btn btn-primary" style={{ flex: 2 }} onClick={handleSubmit} disabled={saving || !name || !phone}>{saving ? "Saving..." : (isEdit ? "Update" : "Add")}</button>
           </div>
         </div>
       </div>
@@ -617,24 +662,18 @@ function NewTaskModal({ employees, onClose, onSuccess }: { employees: User[]; on
     setError("");
     setSaving(true);
     try {
-      await api.post("/tasks", {
-        title, assigned_to: assignedTo, priority,
-        due_date: dueDate || null, reward_points: points,
-      });
+      await api.post("/tasks", { title, assigned_to: assignedTo, priority, due_date: dueDate || null, reward_points: points });
       onSuccess();
       onClose();
-    } catch (err: any) {
-      setError(err.response?.data?.message || "Failed to create task");
-    } finally {
-      setSaving(false);
-    }
+    } catch (err: any) { setError(err.response?.data?.message || "Failed"); }
+    finally { setSaving(false); }
   };
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, backdropFilter: "blur(4px)" }} onClick={onClose}>
       <div style={{ background: "#131928", border: "1px solid rgba(255,255,255,0.10)", borderRadius: 16, padding: 28, width: 440 }} onClick={(e) => e.stopPropagation()}>
         <h2 style={{ fontFamily: "'Syne', sans-serif", fontSize: 18, fontWeight: 700, marginBottom: 4 }}>New Task</h2>
-        <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", marginBottom: 20 }}>Employee will receive task via WhatsApp instantly</div>
+        <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", marginBottom: 20 }}>Will trigger WhatsApp send — see logs panel</div>
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           <input placeholder="Task title" value={title} onChange={(e) => setTitle(e.target.value)} />
           <select value={assignedTo} onChange={(e) => setAssignedTo(e.target.value)}>
@@ -652,11 +691,9 @@ function NewTaskModal({ employees, onClose, onSuccess }: { employees: User[]; on
           </div>
           <input type="datetime-local" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
           {error && <div style={{ fontSize: 12, color: "#ef4444", padding: "8px 12px", background: "rgba(239,68,68,0.1)", borderRadius: 6 }}>⚠️ {error}</div>}
-          <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+          <div style={{ display: "flex", gap: 8 }}>
             <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onClose}>Cancel</button>
-            <button className="btn btn-primary" style={{ flex: 2 }} onClick={handleSubmit} disabled={saving || !title || !assignedTo}>
-              {saving ? "Assigning..." : "Assign via WhatsApp"}
-            </button>
+            <button className="btn btn-primary" style={{ flex: 2 }} onClick={handleSubmit} disabled={saving || !title || !assignedTo}>{saving ? "Assigning..." : "Assign + WhatsApp"}</button>
           </div>
         </div>
       </div>

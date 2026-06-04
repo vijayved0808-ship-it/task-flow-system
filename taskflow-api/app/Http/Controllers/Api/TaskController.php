@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Domain\Task\Models\Task;
 use App\Domain\WhatsApp\Services\WhatsAppService;
+use App\Domain\Logs\Models\ActivityLog;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 
@@ -46,45 +47,47 @@ class TaskController extends Controller
             $task = Task::create($data);
             $task->load(['assignedTo', 'assignedBy']);
 
-            Log::info('Task created', [
-                'task_id'     => $task->id,
-                'assigned_to' => $task->assigned_to,
-                'title'       => $task->title
-            ]);
-
-            // Send WhatsApp notification to assigned user (non-blocking)
-            try {
-                if ($task->assignedTo && $task->assignedTo->phone) {
-                    $sent = $this->wa->sendTaskAssignment($task);
-                    Log::info('Task assignment WA result', [
-                        'task_id' => $task->id,
-                        'to'      => $task->assignedTo->phone,
-                        'sent'    => $sent
-                    ]);
-                } else {
-                    Log::warning('Task created but assignee has no phone', ['task_id' => $task->id]);
-                }
-            } catch (\Exception $waError) {
-                Log::error('WhatsApp send failed for task', [
+            ActivityLog::record(
+                'task', 'create', 'success',
+                "📋 Task created: {$task->title}",
+                [
                     'task_id' => $task->id,
-                    'error'   => $waError->getMessage()
-                ]);
-                // Don't fail the request
+                    'assigned_to' => $task->assignedTo?->name,
+                    'phone' => $task->assignedTo?->phone,
+                    'points' => $task->reward_points
+                ],
+                $task->assignedTo?->phone
+            );
+
+            // Send WhatsApp notification
+            if ($task->assignedTo && $task->assignedTo->phone) {
+                $this->wa->sendTaskAssignment($task);
+            } else {
+                ActivityLog::record(
+                    'task', 'whatsapp_skip', 'failed',
+                    "Task created but assignee has no phone — WhatsApp skipped",
+                    ['task_id' => $task->id]
+                );
             }
 
             return response()->json($task, 201);
 
         } catch (\Illuminate\Validation\ValidationException $e) {
+            ActivityLog::record(
+                'task', 'create', 'failed',
+                "Task validation failed",
+                ['errors' => $e->errors()]
+            );
             return response()->json([
                 'message' => 'Validation failed',
                 'errors'  => $e->errors()
             ], 422);
         } catch (\Exception $e) {
-            Log::error('Task creation failed', [
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
-                'input' => $request->all()
-            ]);
+            ActivityLog::record(
+                'task', 'create', 'failed',
+                "Task creation error: " . $e->getMessage(),
+                ['exception' => get_class($e)]
+            );
             return response()->json([
                 'message' => 'Server error: ' . $e->getMessage()
             ], 500);
