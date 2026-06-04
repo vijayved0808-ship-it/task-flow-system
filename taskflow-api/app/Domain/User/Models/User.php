@@ -30,6 +30,7 @@ class User extends Authenticatable
         'password'           => 'hashed',
         'whatsapp_opted_in'  => 'boolean',
         'is_active'          => 'boolean',
+        'wa_session_state'   => 'array',
     ];
 
     // Role helpers

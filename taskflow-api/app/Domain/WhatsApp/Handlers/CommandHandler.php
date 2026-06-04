@@ -17,6 +17,16 @@ class CommandHandler
     public function handle(User $user, string $command, string $fullMessage, ?string $waMessageId = null): string
     {
         $user->update(['last_seen_at' => now()]);
+
+        // ── If user replies with JUST a number, treat as task selection from previous list ──
+        $textTrimmed = trim($fullMessage);
+        if (preg_match('/^(\d+)$/', $textTrimmed, $numMatch)) {
+            $resolved = $this->resolveNumericReply($user, (int) $numMatch[1]);
+            if ($resolved !== null) {
+                return $this->handle($user, $resolved['command'], $resolved['synthetic_message'], $waMessageId);
+            }
+        }
+
         $cmd = strtoupper(trim($command));
 
         if ($user->isManager()) {
@@ -349,8 +359,9 @@ class CommandHandler
 
     private function handleStart(User $user, string $message): string
     {
-        $task = $this->getActiveTask($user);
-        if (!$task) return "No active task found.\n\nReply *STATUS* to see your tasks.";
+        $resolve = $this->resolveTaskForCommand($user, 'START', $message);
+        if (isset($resolve['reply'])) return $resolve['reply'];
+        $task = $resolve['task'];
 
         $task->update(['status' => 'in_progress']);
         $this->logUpdate($task, $user, 'start', $message);
@@ -365,13 +376,15 @@ class CommandHandler
 
     private function handleUpdate(User $user, string $message, ?string $waMessageId): string
     {
-        $task = $this->getActiveTask($user);
-        if (!$task) return "No active task found.";
+        $resolve = $this->resolveTaskForCommand($user, 'UPDATE', $message);
+        if (isset($resolve['reply'])) return $resolve['reply'];
+        $task = $resolve['task'];
 
         $this->logUpdate($task, $user, 'update', $message, $waMessageId);
 
         if ($task->assignedBy && $task->assignedBy->phone) {
-            $cleanMsg = preg_replace('/^UPDATE\s*/i', '', $message);
+            // Strip "UPDATE" + optional task number prefix
+            $cleanMsg = preg_replace('/^UPDATE\s*(\d+)?\s*/i', '', $message);
             $this->wa->sendMessage($task->assignedBy->phone,
                 "📝 *{$user->name} update*\n\n📋 " . $task->title . "\n💬 " . trim($cleanMsg)
             );
@@ -381,8 +394,9 @@ class CommandHandler
 
     private function handleComplete(User $user, string $message, ?string $waMessageId): string
     {
-        $task = $this->getActiveTask($user);
-        if (!$task) return "No active task found.";
+        $resolve = $this->resolveTaskForCommand($user, 'COMPLETE', $message);
+        if (isset($resolve['reply'])) return $resolve['reply'];
+        $task = $resolve['task'];
 
         $task->update(['status' => 'completed', 'completed_at' => now()]);
         $this->logUpdate($task, $user, 'complete', $message, $waMessageId);
@@ -402,14 +416,15 @@ class CommandHandler
 
     private function handleDelay(User $user, string $message): string
     {
-        $task = $this->getActiveTask($user);
-        if (!$task) return "No active task found.";
+        $resolve = $this->resolveTaskForCommand($user, 'DELAY', $message);
+        if (isset($resolve['reply'])) return $resolve['reply'];
+        $task = $resolve['task'];
 
         $task->update(['status' => 'waiting']);
         $this->logUpdate($task, $user, 'delay', $message);
 
         if ($task->assignedBy && $task->assignedBy->phone) {
-            $reason = preg_replace('/^DELAY\s*/i', '', $message);
+            $reason = preg_replace('/^DELAY\s*(\d+)?\s*/i', '', $message);
             $this->wa->sendMessage($task->assignedBy->phone,
                 "⏰ *{$user->name} reported delay*\n\n📋 " . $task->title . "\nReason: " . trim($reason)
             );
@@ -419,14 +434,15 @@ class CommandHandler
 
     private function handleEscalate(User $user, string $message): string
     {
-        $task = $this->getActiveTask($user);
-        if (!$task) return "No active task found.";
+        $resolve = $this->resolveTaskForCommand($user, 'ESCALATE', $message);
+        if (isset($resolve['reply'])) return $resolve['reply'];
+        $task = $resolve['task'];
 
         $task->update(['status' => 'escalated']);
         $this->logUpdate($task, $user, 'escalate', $message);
 
         if ($task->assignedBy && $task->assignedBy->phone) {
-            $issue = preg_replace('/^ESCALATE\s*/i', '', $message);
+            $issue = preg_replace('/^ESCALATE\s*(\d+)?\s*/i', '', $message);
             $this->wa->sendMessage($task->assignedBy->phone,
                 "🚨 *{$user->name} escalated*\n\n📋 " . $task->title . "\nIssue: " . trim($issue)
             );
@@ -497,7 +513,8 @@ class CommandHandler
              . "*ESCALATE <issue>* — Flag urgent\n"
              . "*STATUS* — View tasks\n"
              . "*SCORE* — Your APIX\n"
-             . "*HELP* — This menu";
+             . "*HELP* — This menu\n\n"
+             . "💡 Multiple tasks? Bot list dega, phir *START 1*, *COMPLETE 2* etc.";
     }
 
     private function getActiveTask(User $user): ?Task
@@ -505,6 +522,123 @@ class CommandHandler
         return Task::where('assigned_to', $user->id)
             ->whereIn('status', ['assigned', 'accepted', 'in_progress', 'waiting'])
             ->latest()->first();
+    }
+
+    /**
+     * Get all active tasks for user, ordered oldest first (stable for numbered list).
+     */
+    private function getActiveTasksList(User $user)
+    {
+        return Task::where('assigned_to', $user->id)
+            ->whereIn('status', ['assigned', 'accepted', 'in_progress', 'waiting'])
+            ->orderBy('created_at')
+            ->get();
+    }
+
+    /**
+     * Resolve which task an employee command refers to.
+     * Returns ['task' => Task] on success, ['reply' => string] when bot needs to ask user.
+     *
+     * Rules:
+     * - 0 active tasks → reply: "no active task"
+     * - 1 active task  → use it (backward-compatible, current behavior unchanged)
+     * - 2+ active tasks + message has "COMMAND <number>" → pick that one
+     * - 2+ active tasks + no number → show numbered list, save session state
+     */
+    private function resolveTaskForCommand(User $user, string $cmdName, string $fullMessage): array
+    {
+        $activeTasks = $this->getActiveTasksList($user);
+
+        if ($activeTasks->isEmpty()) {
+            return ['reply' => "No active task found.\n\nReply *STATUS* to see your tasks."];
+        }
+
+        if ($activeTasks->count() === 1) {
+            return ['task' => $activeTasks->first()];
+        }
+
+        // Multiple — try to extract number after command word: "COMPLETE 2 ..." or "COMPLETE 2"
+        $hasNumber = preg_match('/^\s*[A-Za-z]+\s+(\d+)(?:\s|$)/', $fullMessage, $m);
+        if ($hasNumber) {
+            $idx = (int) $m[1];
+            if ($idx >= 1 && $idx <= $activeTasks->count()) {
+                return ['task' => $activeTasks[$idx - 1]];
+            }
+            return ['reply' => "⚠️ Galat number. Aapke paas *{$activeTasks->count()}* active tasks hain. Reply *STATUS* phir se dekhne ke liye."];
+        }
+
+        // No number — show numbered list + save session state for 10 min
+        $cmdUpper = strtoupper($cmdName);
+        $msg = "🤔 Aapke paas *{$activeTasks->count()}* active tasks hain:\n\n";
+        $options = [];
+        foreach ($activeTasks as $i => $t) {
+            $num = $i + 1;
+            $msg .= "*{$num}.* " . $t->title . "\n";
+            $options[$num] = $t->id;
+        }
+        $msg .= "\nReply: *{$cmdUpper} 1*, *{$cmdUpper} 2*, etc.\n";
+        $msg .= "Ya sirf number bhejke: *1*, *2*, ...";
+
+        $user->wa_session_state = [
+            'awaiting'   => 'task_selection',
+            'command'    => $cmdUpper,
+            'options'    => $options,
+            'expires_at' => now()->addMinutes(10)->toIso8601String(),
+        ];
+        $user->save();
+
+        return ['reply' => $msg];
+    }
+
+    /**
+     * Handle a bare-number reply ("2") by checking session state.
+     * Returns ['command' => 'COMPLETE', 'synthetic_message' => 'COMPLETE 2'] or null if no valid session.
+     */
+    private function resolveNumericReply(User $user, int $num): ?array
+    {
+        $state = $user->wa_session_state;
+        if (!is_array($state) || ($state['awaiting'] ?? null) !== 'task_selection') {
+            return null;
+        }
+
+        // Expiry check
+        if (!empty($state['expires_at'])) {
+            try {
+                if (\Carbon\Carbon::parse($state['expires_at'])->isPast()) {
+                    $user->wa_session_state = null;
+                    $user->save();
+                    return null;
+                }
+            } catch (\Exception $e) {
+                // Bad timestamp — clear state and bail
+                $user->wa_session_state = null;
+                $user->save();
+                return null;
+            }
+        }
+
+        $taskId = $state['options'][$num] ?? null;
+        if (!$taskId) return null;
+
+        $command = $state['command'] ?? null;
+        if (!$command) return null;
+
+        // Clear state — about to dispatch
+        $user->wa_session_state = null;
+        $user->save();
+
+        // Verify task still belongs to user and is active, and find its CURRENT index
+        // (active list may have shifted if some tasks completed since list was shown)
+        $activeTasks = $this->getActiveTasksList($user);
+        $idx = $activeTasks->search(fn($t) => $t->id === $taskId);
+        if ($idx === false) {
+            // Task no longer active. We can't fail silently — synthesize reply via a non-recursing path.
+            // Return null and let caller fall through to normal flow which will handle "no active task".
+            return null;
+        }
+
+        $currentNum = $idx + 1;
+        return ['command' => $command, 'synthetic_message' => "{$command} {$currentNum}"];
     }
 
     private function logUpdate(Task $task, User $user, string $command, string $message, ?string $waMessageId = null): void
