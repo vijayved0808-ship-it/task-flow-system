@@ -28,6 +28,8 @@ Route::middleware(['auth:sanctum', 'throttle:300,1'])->group(function () {
     Route::put('tasks/{task}/status', [TaskController::class, 'updateStatus']);
     Route::get('tasks/{task}/updates', [TaskController::class, 'updates']);
 
+    // User CRUD + tree
+    Route::get('users/tree', [UserController::class, 'tree']);
     Route::apiResource('users', UserController::class);
     Route::get('users/{user}/tasks', [UserController::class, 'tasks']);
     Route::get('users/{user}/scores', [UserController::class, 'scores']);
@@ -46,7 +48,6 @@ Route::middleware(['auth:sanctum', 'throttle:300,1'])->group(function () {
         Route::get('/reports/{type}', [AIController::class, 'report']);
     });
 
-    // Activity logs (for debug/monitoring)
     Route::get('/logs', [LogsController::class, 'index']);
     Route::delete('/logs', [LogsController::class, 'destroy']);
 });
