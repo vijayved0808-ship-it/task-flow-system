@@ -3,7 +3,7 @@
 namespace App\Domain\User\Models;
 
 use App\Domain\Task\Models\Task;
-use App\Domain\Analytics\Models\ApixScore;
+use App\Domain\Task\Models\ApixScore;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;

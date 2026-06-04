@@ -6,7 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Domain\Task\Models\Task;
 use App\Domain\Task\Models\TaskUpdate;
 use App\Domain\User\Models\User;
-use App\Domain\Analytics\Models\ApixScore;
+use App\Domain\Task\Models\ApixScore;
 use Illuminate\Http\Request;
 use Carbon\Carbon;
 

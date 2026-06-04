@@ -5,7 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Domain\Task\Models\Task;
 use App\Domain\User\Models\User;
-use App\Domain\Analytics\Models\ApixScore;
+use App\Domain\Task\Models\ApixScore;
 
 class AIController extends Controller
 {
