@@ -353,7 +353,8 @@ export default function Dashboard() {
           <div style={{ margin: "12px 12px 4px", background: "rgba(34,211,238,0.08)", border: "1px solid rgba(34,211,238,0.15)", borderRadius: 8, padding: "8px 12px" }}>
             <div style={{ fontSize: 10, color: "#22d3ee", fontFamily: "'DM Mono', monospace", marginBottom: 2 }}>TENANT</div>
             <div style={{ fontSize: 12, fontWeight: 600 }}>UIC Group</div>
-            <div style={{ fontSize: 10, color: "rgba(226,232,240,0.35)" }}>{activeUsersCount} active users</div>
+            <div style={{ fontSize: 10, color: "rgba(226,232,240,0.35)" }}>Ahmedabad · 26 branches</div>
+            <div style={{ fontSize: 9, color: "rgba(34,211,238,0.6)", marginTop: 3, fontFamily: "'DM Mono', monospace" }}>● {activeUsersCount} active now</div>
           </div>
           <nav style={{ padding: "8px", flex: 1 }}>
             {NAV.map(item => (
@@ -370,6 +371,9 @@ export default function Dashboard() {
               </button>
             ))}
           </nav>
+          <div style={{ padding: "8px 12px 0" }}>
+            <button className="btn btn-ghost" onClick={() => showNotif("WA Simulator coming soon — for now send messages to the bot directly")} style={{ width: "100%", justifyContent: "center", fontSize: 11, padding: "7px 10px" }}>💬 WA Simulator</button>
+          </div>
           <div style={{ padding: 12, borderTop: "1px solid rgba(255,255,255,0.06)" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
               <div style={{ width: 32, height: 32, borderRadius: "50%", background: "linear-gradient(135deg, #10b981, #059669)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700 }}>{user?.name?.charAt(0)}</div>
@@ -407,7 +411,7 @@ export default function Dashboard() {
               </div>
               <button className="btn btn-ghost" onClick={loadData}>↻</button>
               {(activeView === "people" || activeView === "tree") && <button className="btn btn-primary" onClick={() => setShowAddUser(true)}>+ Add User</button>}
-              {activeView === "tasks" && <button className="btn btn-primary" onClick={() => setShowNewTask(true)}>+ New Task</button>}
+              {(activeView === "tasks" || activeView === "overview") && <button className="btn btn-primary" onClick={() => setShowNewTask(true)}>+ New Task</button>}
               {activeView === "logs" && <button className="btn btn-danger" onClick={handleClearLogs}>🗑 Clear</button>}
             </div>
           </header>
