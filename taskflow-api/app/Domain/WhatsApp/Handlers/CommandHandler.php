@@ -6,6 +6,7 @@ use App\Domain\Task\Models\Task;
 use App\Domain\Task\Models\TaskUpdate;
 use App\Domain\User\Models\User;
 use App\Domain\WhatsApp\Services\WhatsAppService;
+use App\Domain\Logs\Models\ActivityLog;
 use App\Jobs\RecalculateApixScore;
 use Illuminate\Support\Facades\Hash;
 
@@ -18,7 +19,7 @@ class CommandHandler
         $user->update(['last_seen_at' => now()]);
         $cmd = strtoupper(trim($command));
 
-        // Manager/Admin commands
+        // Manager/Admin commands first
         if ($user->isManager()) {
             $managerResult = $this->tryManagerCommand($user, $cmd, $fullMessage);
             if ($managerResult !== null) return $managerResult;
@@ -33,42 +34,45 @@ class CommandHandler
             'ESCALATE' => $this->handleEscalate($user, $fullMessage),
             'SCORE'    => $this->handleScore($user),
             'STATUS'   => $this->handleStatus($user),
+            'MY TASKS' => $this->handleStatus($user),
             'HELP'     => $this->helpMessage($user),
             default    => $this->handleUnknown($user, $fullMessage, $waMessageId),
         };
     }
 
-    // ============ MANAGER COMMANDS ============
-
     private function tryManagerCommand(User $manager, string $cmd, string $fullMessage): ?string
     {
-        // ASSIGN <employee_name> <task_title>
-        if (str_starts_with($cmd, 'ASSIGN ')) {
+        // ASSIGN — uses fullMessage to parse name + task
+        if ($cmd === 'ASSIGN') {
             return $this->handleAssign($manager, $fullMessage);
         }
-        // ADD EMPLOYEE <name> <phone> <designation>
-        if (str_starts_with($cmd, 'ADD EMPLOYEE')) {
+        // ADD EMPLOYEE
+        if ($cmd === 'ADD EMPLOYEE') {
             return $this->handleAddEmployee($manager, $fullMessage);
         }
-        // LIST EMPLOYEES
-        if ($cmd === 'LIST EMPLOYEES' || $cmd === 'LIST') {
+        // LIST or LIST EMPLOYEES
+        if ($cmd === 'LIST' || $cmd === 'LIST EMPLOYEES') {
             return $this->handleListEmployees($manager);
         }
-        // REPORT TODAY / REPORT WEEK
-        if (str_starts_with($cmd, 'REPORT')) {
+        // REPORT TODAY / REPORT WEEK / REPORT
+        if ($cmd === 'REPORT TODAY' || $cmd === 'REPORT WEEK' || $cmd === 'REPORT') {
             return $this->handleReport($manager, $cmd);
         }
-        // VERIFY <task_id>
-        if (str_starts_with($cmd, 'VERIFY ')) {
+        // VERIFY
+        if ($cmd === 'VERIFY') {
             return $this->handleVerify($manager, $fullMessage);
         }
-        // REJECT <task_id> <reason>
-        if (str_starts_with($cmd, 'REJECT ')) {
+        // REJECT
+        if ($cmd === 'REJECT') {
             return $this->handleReject($manager, $fullMessage);
         }
-        // STATUS <employee_name>
-        if (str_starts_with($cmd, 'STATUS ') && strlen($cmd) > 8) {
-            return $this->handleEmployeeStatus($manager, $fullMessage);
+        // STATUS <name> — only if message has more than just "STATUS"
+        if ($cmd === 'STATUS') {
+            $parts = preg_split('/\s+/', trim($fullMessage), 2);
+            if (count($parts) === 2 && !empty($parts[1])) {
+                return $this->handleEmployeeStatus($manager, $fullMessage);
+            }
+            // Just "STATUS" — fall through to employee status logic
         }
         return null;
     }
@@ -84,16 +88,28 @@ class CommandHandler
         $employeeName = $parts[1];
         $taskTitle    = $parts[2];
 
-        // Find employee by first name (case insensitive)
-        $employee = User::where('role', 'employee')
-            ->where('is_active', true)
+        ActivityLog::record(
+            'task', 'assign_attempt', 'info',
+            "🔍 Looking for employee: \"{$employeeName}\"",
+            ['manager_id' => $manager->id, 'task_title' => $taskTitle]
+        );
+
+        // Find employee by ANY part of name (case insensitive, more flexible)
+        $employee = User::where('is_active', true)
+            ->where('id', '!=', $manager->id)  // Don't assign to self
             ->where(function ($q) use ($employeeName) {
-                $q->whereRaw('LOWER(name) LIKE ?', [strtolower($employeeName) . '%'])
-                  ->orWhereRaw('LOWER(SPLIT_PART(name, \' \', 1)) = ?', [strtolower($employeeName)]);
+                $term = strtolower($employeeName);
+                $q->whereRaw('LOWER(name) LIKE ?', ['%' . $term . '%'])
+                  ->orWhereRaw('LOWER(SPLIT_PART(name, \' \', 1)) = ?', [$term]);
             })
             ->first();
 
         if (!$employee) {
+            ActivityLog::record(
+                'task', 'assign', 'failed',
+                "❌ Employee \"{$employeeName}\" not found",
+                ['manager_id' => $manager->id]
+            );
             return "❌ *Employee \"{$employeeName}\" not found*\n\nReply *LIST* to see all employees.";
         }
 
@@ -101,7 +117,7 @@ class CommandHandler
         $dueDate = $this->parseDueDate($taskTitle);
 
         $task = Task::create([
-            'tenant_id'     => 'default', // Single tenant for now
+            'tenant_id'     => 'default',
             'title'         => $taskTitle,
             'assigned_by'   => $manager->id,
             'assigned_to'   => $employee->id,
@@ -110,6 +126,21 @@ class CommandHandler
             'due_date'      => $dueDate,
             'reward_points' => 50,
         ]);
+
+        ActivityLog::record(
+            'task', 'assign', 'success',
+            "✅ Task assigned to {$employee->name}: \"{$taskTitle}\"",
+            [
+                'task_id' => $task->id,
+                'employee_id' => $employee->id,
+                'manager_id' => $manager->id,
+                'phone' => $employee->phone
+            ],
+            $employee->phone
+        );
+
+        // Load relationships for notification
+        $task->load(['assignedTo', 'assignedBy']);
 
         // Notify employee via WhatsApp
         $this->wa->sendTaskAssignment($task);
@@ -121,35 +152,28 @@ class CommandHandler
              . "📋 Task: {$taskTitle}\n"
              . "🆔 Task ID: T-" . substr($task->id, 0, 6) . "\n"
              . "📅 Due: {$dueStr}\n\n"
-             . "Employee has been notified via WhatsApp.";
+             . "Employee notified via WhatsApp.";
     }
 
     private function handleAddEmployee(User $manager, string $message): string
     {
-        // Format: ADD EMPLOYEE <name> <phone> [designation]
-        // Example: ADD EMPLOYEE Priya Sharma +919876543210 Field Executive
         $message = preg_replace('/^ADD EMPLOYEE\s+/i', '', trim($message));
-        
-        // Extract phone number
+
         if (!preg_match('/(\+?\d{10,15})/', $message, $phoneMatch)) {
             return "❌ *Invalid format*\n\nUse:\n*ADD EMPLOYEE <name> <phone> <designation>*\n\nExample:\nADD EMPLOYEE Priya Sharma +919876543210 Field Executive";
         }
 
         $phone = $phoneMatch[1];
         if (!str_starts_with($phone, '+')) {
-            $phone = '+91' . $phone; // Default India
+            $phone = '+91' . $phone;
         }
 
-        // Split name (before phone) and designation (after phone)
         $parts = preg_split('/' . preg_quote($phoneMatch[1], '/') . '/', $message);
         $name = trim($parts[0]);
         $designation = isset($parts[1]) ? trim($parts[1]) : 'Employee';
 
-        if (empty($name)) {
-            return "❌ Name is required.";
-        }
+        if (empty($name)) return "❌ Name is required.";
 
-        // Check if already exists
         if (User::where('phone', $phone)->exists()) {
             return "❌ Employee with phone {$phone} already exists.";
         }
@@ -157,7 +181,7 @@ class CommandHandler
         $employee = User::create([
             'name'              => $name,
             'phone'             => $phone,
-            'email'             => strtolower(str_replace(' ', '.', $name)) . '@uicgroup.com',
+            'email'             => strtolower(str_replace(' ', '.', $name)) . '+' . substr(uniqid(), -4) . '@uicgroup.com',
             'password'          => Hash::make('Emp@2026'),
             'role'              => 'employee',
             'designation'       => $designation,
@@ -165,20 +189,24 @@ class CommandHandler
             'is_active'         => true,
         ]);
 
-        // Send welcome message to new employee
+        ActivityLog::record(
+            'user', 'create', 'success',
+            "✅ Employee added via WhatsApp: {$name}",
+            ['user_id' => $employee->id, 'created_by' => $manager->id],
+            $phone
+        );
+
         $this->wa->sendMessage($phone,
             "👋 *Welcome to TaskFlow!*\n\n"
             . "You've been added by {$manager->name}.\n\n"
             . "📱 You'll receive tasks here on WhatsApp.\n"
-            . "Reply *HELP* anytime to see all commands.\n\n"
-            . "Let's get started! 💪"
+            . "Reply *HELP* anytime to see all commands."
         );
 
         return "✅ *Employee Added!*\n\n"
              . "👤 Name: {$name}\n"
              . "📱 Phone: {$phone}\n"
-             . "💼 Role: {$designation}\n\n"
-             . "Welcome message sent to employee.";
+             . "💼 Role: {$designation}";
     }
 
     private function handleListEmployees(User $manager): string
@@ -198,7 +226,7 @@ class CommandHandler
                 ->whereNotIn('status', ['completed', 'verified'])->count();
             $msg .= ($i + 1) . ". *{$emp->name}*\n";
             $msg .= "   📱 {$emp->phone}\n";
-            $msg .= "   💼 {$emp->designation}\n";
+            $msg .= "   💼 " . ($emp->designation ?: 'Employee') . "\n";
             $msg .= "   📋 {$activeTasks} active tasks\n\n";
         }
         return trim($msg);
@@ -208,7 +236,7 @@ class CommandHandler
     {
         $period = str_contains($cmd, 'WEEK') ? 'week' : 'today';
         $start = $period === 'week' ? now()->startOfWeek() : today();
-        
+
         $assigned  = Task::whereBetween('created_at', [$start, now()])->count();
         $completed = Task::whereIn('status', ['completed', 'verified'])
             ->whereBetween('completed_at', [$start, now()])->count();
@@ -217,13 +245,12 @@ class CommandHandler
         $activeEmployees = User::where('role', 'employee')->where('is_active', true)->count();
 
         $label = $period === 'week' ? 'This Week' : 'Today';
-        
+
         return "📊 *{$label}'s Report*\n\n"
              . "📋 Tasks Assigned: {$assigned}\n"
              . "✅ Completed: {$completed}\n"
              . "⚠️ Overdue: {$overdue}\n"
-             . "👥 Active Team: {$activeEmployees}\n\n"
-             . "View detailed report on dashboard.";
+             . "👥 Active Team: {$activeEmployees}";
     }
 
     private function handleVerify(User $manager, string $message): string
@@ -236,10 +263,7 @@ class CommandHandler
         $taskId = str_replace('T-', '', $parts[1]);
         $task = Task::where('id', 'LIKE', $taskId . '%')->first();
 
-        if (!$task) {
-            return "❌ Task not found: {$parts[1]}";
-        }
-
+        if (!$task) return "❌ Task not found: {$parts[1]}";
         if ($task->status !== 'completed') {
             return "⚠️ Task is not in completed state (current: {$task->status})";
         }
@@ -250,16 +274,13 @@ class CommandHandler
             'verified_at' => now(),
         ]);
 
-        // Notify employee
         if ($task->assignedTo) {
             $this->wa->sendMessage($task->assignedTo->phone,
                 "🎉 *Task Verified!*\n\n"
                 . "📋 {$task->title}\n"
                 . "✅ Verified by {$manager->name}\n"
-                . "⭐ +{$task->reward_points} points credited!\n\n"
-                . "Great work! 💪"
+                . "⭐ +{$task->reward_points} points credited!"
             );
-
             RecalculateApixScore::dispatch($task->assignedTo->id);
         }
 
@@ -269,9 +290,7 @@ class CommandHandler
     private function handleReject(User $manager, string $message): string
     {
         $parts = preg_split('/\s+/', trim($message), 3);
-        if (count($parts) < 3) {
-            return "❌ Use: *REJECT <task-id> <reason>*";
-        }
+        if (count($parts) < 3) return "❌ Use: *REJECT <task-id> <reason>*";
 
         $taskId = str_replace('T-', '', $parts[1]);
         $reason = $parts[2];
@@ -289,7 +308,7 @@ class CommandHandler
                 . "Please rework and resubmit."
             );
         }
-        return "✅ Task rejected. Employee notified with reason.";
+        return "✅ Task rejected. Employee notified.";
     }
 
     private function handleEmployeeStatus(User $manager, string $message): string
@@ -298,7 +317,8 @@ class CommandHandler
         $name = $parts[1] ?? '';
 
         $employee = User::where('role', 'employee')
-            ->whereRaw('LOWER(name) LIKE ?', [strtolower($name) . '%'])
+            ->where('is_active', true)
+            ->whereRaw('LOWER(name) LIKE ?', ['%' . strtolower($name) . '%'])
             ->first();
 
         if (!$employee) return "❌ Employee \"{$name}\" not found.";
@@ -336,13 +356,11 @@ class CommandHandler
         $task->update(['status' => 'in_progress']);
         $this->logUpdate($task, $user, 'start', $message);
 
-        // Notify manager
         if ($task->assignedBy && $task->assignedBy->phone) {
             $this->wa->sendMessage($task->assignedBy->phone,
                 "▶️ *{$user->name} started task*\n\n📋 " . $task->title
             );
         }
-
         return "✅ *Task Started!*\n\n📋 {$task->title}\n\nSend updates with *UPDATE*\nMark done with *COMPLETE*";
     }
 
@@ -353,16 +371,12 @@ class CommandHandler
 
         $this->logUpdate($task, $user, 'update', $message, $waMessageId);
 
-        // Notify manager with update content
         if ($task->assignedBy && $task->assignedBy->phone) {
             $cleanMsg = preg_replace('/^UPDATE\s*/i', '', $message);
             $this->wa->sendMessage($task->assignedBy->phone,
-                "📝 *{$user->name} update*\n\n"
-                . "📋 " . $task->title . "\n"
-                . "💬 " . trim($cleanMsg)
+                "📝 *{$user->name} update*\n\n📋 " . $task->title . "\n💬 " . trim($cleanMsg)
             );
         }
-
         return "📝 *Update logged!*\n\nKeep going 💪\nSend *COMPLETE* when done.";
     }
 
@@ -383,12 +397,9 @@ class CommandHandler
                 . "Or *REJECT T-" . substr($task->id, 0, 6) . " <reason>* to reject"
             );
         }
-
         RecalculateApixScore::dispatch($user->id);
 
-        return "🎉 *Task Completed!*\n\n📋 {$task->title}\n\n"
-             . "Manager notified for verification.\n"
-             . "⭐ +{$task->reward_points} points pending approval.";
+        return "🎉 *Task Completed!*\n\n📋 {$task->title}\n\nManager notified for verification.";
     }
 
     private function handleDelay(User $user, string $message): string
@@ -402,9 +413,7 @@ class CommandHandler
         if ($task->assignedBy && $task->assignedBy->phone) {
             $reason = preg_replace('/^DELAY\s*/i', '', $message);
             $this->wa->sendMessage($task->assignedBy->phone,
-                "⏰ *{$user->name} reported delay*\n\n"
-                . "📋 " . $task->title . "\n"
-                . "Reason: " . trim($reason)
+                "⏰ *{$user->name} reported delay*\n\n📋 " . $task->title . "\nReason: " . trim($reason)
             );
         }
         return "⏰ *Delay noted.* Manager informed.\n\nSend *START* to resume.";
@@ -421,25 +430,19 @@ class CommandHandler
         if ($task->assignedBy && $task->assignedBy->phone) {
             $issue = preg_replace('/^ESCALATE\s*/i', '', $message);
             $this->wa->sendMessage($task->assignedBy->phone,
-                "🚨 *{$user->name} escalated task*\n\n"
-                . "📋 " . $task->title . "\n"
-                . "Issue: " . trim($issue) . "\n\n"
-                . "Immediate attention required!"
+                "🚨 *{$user->name} escalated task*\n\n📋 " . $task->title . "\nIssue: " . trim($issue)
             );
         }
-        return "🚨 *Escalated to manager.*\nThey've been notified immediately.";
+        return "🚨 *Escalated to manager.*";
     }
 
     private function handleScore(User $user): string
     {
         $score = $user->apixScores()->where('score_date', today())->first();
-        if (!$score) {
-            return "📊 *Your APIX Today*\n\nNo score calculated yet.\nComplete tasks to build your score!";
-        }
+        if (!$score) return "📊 *Your APIX Today*\n\nNo score yet. Complete tasks to build score!";
+
         $band = $this->getApixBand($score->apix_score);
-        return "📊 *Your APIX Score*\n\n"
-             . "🏆 {$score->apix_score} — {$band}\n\n"
-             . "Tasks: {$score->tasks_completed}/{$score->tasks_assigned}";
+        return "📊 *Your APIX Score*\n\n🏆 {$score->apix_score} — {$band}\n\nTasks: {$score->tasks_completed}/{$score->tasks_assigned}";
     }
 
     private function handleStatus(User $user): string
@@ -484,13 +487,13 @@ class CommandHandler
                  . "*REPORT WEEK* — Week stats\n"
                  . "*VERIFY <task-id>* — Approve task\n"
                  . "*REJECT <task-id> <reason>* — Reject\n\n"
-                 . "Example:\nASSIGN Priya Visit Dr. Patel today";
+                 . "Example:\nASSIGN Parag Visit Dr. Patel today";
         }
 
         return "📋 *Employee Commands*\n\n"
              . "*START* — Begin task\n"
              . "*UPDATE <text>* — Send progress\n"
-             . "*COMPLETE <text>* — Mark done\n"
+             . "*COMPLETE* — Mark done\n"
              . "*DELAY <reason>* — Report delay\n"
              . "*ESCALATE <issue>* — Flag urgent\n"
              . "*STATUS* — View your tasks\n"
