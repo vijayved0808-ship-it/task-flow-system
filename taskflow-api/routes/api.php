@@ -12,7 +12,7 @@ use App\Http\Controllers\Api\LogsController;
 Route::get('/health', function () {
     try { \DB::connection()->getPdo(); $db = 'connected'; }
     catch (\Exception $e) { $db = 'error: ' . $e->getMessage(); }
-    return response()->json(['status' => 'ok', 'db' => $db, 'version' => '1.0.0']);
+    return response()->json(['status' => 'ok', 'db' => $db, 'version' => '2.0.0']);
 });
 
 Route::get('/webhooks/whatsapp', [WebhookController::class, 'verify']);
@@ -28,7 +28,6 @@ Route::middleware(['auth:sanctum', 'throttle:300,1'])->group(function () {
     Route::put('tasks/{task}/status', [TaskController::class, 'updateStatus']);
     Route::get('tasks/{task}/updates', [TaskController::class, 'updates']);
 
-    // User CRUD + tree
     Route::get('users/tree', [UserController::class, 'tree']);
     Route::apiResource('users', UserController::class);
     Route::get('users/{user}/tasks', [UserController::class, 'tasks']);
@@ -41,6 +40,8 @@ Route::middleware(['auth:sanctum', 'throttle:300,1'])->group(function () {
         Route::get('/overview', [AnalyticsController::class, 'overview']);
         Route::get('/leaderboard', [AnalyticsController::class, 'leaderboard']);
         Route::get('/apix/{user}', [AnalyticsController::class, 'apix']);
+        Route::get('/apix-trend', [AnalyticsController::class, 'apixTrend']);
+        Route::get('/reports', [AnalyticsController::class, 'reports']);
     });
 
     Route::prefix('ai')->group(function () {

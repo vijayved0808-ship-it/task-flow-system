@@ -3,19 +3,46 @@ import { useNavigate } from "react-router-dom";
 import { useAuthStore } from "../store/auth";
 import api from "../shared/api/client";
 
+// ─── TYPES ────────────────────────────────────────────────────────────────────
 interface Overview {
   total_tasks: number;
   open_tasks: number;
   completed_tasks: number;
   overdue_tasks: number;
+  completed_today: number;
+  active_employees: number;
+  team_apix: number;
+  apix_delta: number;
+  weekly_trend: number[];
+  status_breakdown: { in_progress: number; completed: number; overdue: number; assigned: number };
+  recent_activity: Array<{ user_name: string; user_initials: string; action: string; task_title: string; time: string; color: string }>;
 }
 
-interface UserStats {
-  total_assigned: number;
-  completed: number;
-  pending: number;
-  overdue: number;
-  direct_reports?: number;
+interface LeaderboardUser {
+  id: string;
+  name: string;
+  first_name: string;
+  initials: string;
+  apix: number;
+  phone: string;
+  role: string;
+  designation?: string;
+}
+
+interface AIInsight {
+  type: 'alert' | 'risk' | 'star' | 'insight';
+  icon: string;
+  title: string;
+  desc: string;
+  action: string;
+  user_id?: string;
+  task_id?: string;
+}
+
+interface ReportData {
+  type: string;
+  label: string;
+  stats: any;
 }
 
 interface User {
@@ -28,12 +55,12 @@ interface User {
   designation?: string;
   reports_to?: string | null;
   is_active: boolean;
-  stats?: UserStats;
+  stats?: { total_assigned: number; completed: number; pending: number; overdue: number };
 }
 
 interface TreeNode extends User {
   children: TreeNode[];
-  stats: UserStats;
+  stats: { total_assigned: number; completed: number; pending: number; overdue: number };
 }
 
 interface Task {
@@ -54,11 +81,11 @@ interface ActivityLogEntry {
   action: string;
   status: string;
   message: string;
-  meta?: any;
   phone?: string;
   created_at: string;
 }
 
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
 const STATUS_CONFIG: Record<string, { label: string; color: string; bg: string }> = {
   assigned:    { label: "Assigned",    color: "#64748b", bg: "rgba(100,116,139,0.12)" },
   accepted:    { label: "Accepted",    color: "#3b82f6", bg: "rgba(59,130,246,0.12)" },
@@ -67,6 +94,8 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; bg: string }
   completed:   { label: "Completed",   color: "#10b981", bg: "rgba(16,185,129,0.12)" },
   verified:    { label: "Verified",    color: "#06b6d4", bg: "rgba(6,182,212,0.12)" },
   rejected:    { label: "Rejected",    color: "#ef4444", bg: "rgba(239,68,68,0.12)" },
+  escalated:   { label: "Escalated",   color: "#f97316", bg: "rgba(249,115,22,0.12)" },
+  overdue:     { label: "Overdue",     color: "#dc2626", bg: "rgba(220,38,38,0.12)" },
 };
 
 const ROLE_CONFIG: Record<string, { label: string; color: string; icon: string }> = {
@@ -75,12 +104,15 @@ const ROLE_CONFIG: Record<string, { label: string; color: string; icon: string }
   employee: { label: "Employee", color: "#10b981", icon: "👤" },
 };
 
-const LOG_STATUS_COLOR = (status: string) => {
-  if (status === 'success') return '#10b981';
-  if (status === 'failed') return '#ef4444';
-  return '#f59e0b';
+const APIX_BAND = (score: number) => {
+  if (score >= 90) return { label: "Elite", color: "#f59e0b" };
+  if (score >= 75) return { label: "High", color: "#10b981" };
+  if (score >= 60) return { label: "On Track", color: "#3b82f6" };
+  if (score >= 45) return { label: "Needs Attn", color: "#f97316" };
+  return { label: "At Risk", color: "#ef4444" };
 };
 
+const LOG_STATUS_COLOR = (s: string) => s === 'success' ? '#10b981' : s === 'failed' ? '#ef4444' : '#f59e0b';
 const LOG_ICON = (type: string, status: string) => {
   if (status === 'failed') return '❌';
   if (type === 'whatsapp_out' && status === 'success') return '✅';
@@ -90,19 +122,95 @@ const LOG_ICON = (type: string, status: string) => {
   return 'ℹ️';
 };
 
+// ─── BAR CHART ────────────────────────────────────────────────────────────────
+const BarChart = ({ data, color = "#22d3ee" }: { data: number[]; color?: string }) => {
+  const max = Math.max(...data, 1);
+  const days = ["M", "T", "W", "T", "F", "S", "S"];
+  return (
+    <div style={{ display: "flex", alignItems: "flex-end", gap: 6, height: 60 }}>
+      {data.map((v, i) => (
+        <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4, flex: 1 }}>
+          <div style={{
+            width: "100%",
+            background: i === data.length - 1 ? color : `${color}55`,
+            borderRadius: "3px 3px 0 0",
+            height: `${(v / max) * 52}px`,
+            transition: "height 0.6s ease",
+            minHeight: 4,
+          }} />
+          <span style={{ fontSize: 9, color: "rgba(255,255,255,0.35)", fontFamily: "'DM Mono', monospace" }}>{days[i]}</span>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// ─── SPARK LINE ───────────────────────────────────────────────────────────────
+const SparkLine = ({ data, color }: { data: number[]; color: string }) => {
+  if (!data || data.length === 0) return null;
+  const max = Math.max(...data, 1);
+  const min = Math.min(...data, 0);
+  const w = 140, h = 50;
+  const range = max - min || 1;
+  const pts = data.map((v, i) => {
+    const x = (i / Math.max(data.length - 1, 1)) * w;
+    const y = h - ((v - min) / range) * (h - 6) - 3;
+    return `${x},${y}`;
+  }).join(" ");
+  const lastIdx = data.length - 1;
+  const lastX = (lastIdx / Math.max(lastIdx, 1)) * w;
+  const lastY = h - ((data[lastIdx] - min) / range) * (h - 6) - 3;
+  return (
+    <svg width={w} height={h} style={{ overflow: "visible" }}>
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx={lastX} cy={lastY} r="3" fill={color} />
+    </svg>
+  );
+};
+
+// ─── APIX RING ────────────────────────────────────────────────────────────────
+const APIXRing = ({ score, size = 54 }: { score: number; size?: number }) => {
+  const band = APIX_BAND(score);
+  const r = size / 2 - 5;
+  const circ = 2 * Math.PI * r;
+  const offset = circ - (score / 100) * circ;
+  return (
+    <div style={{ position: "relative", width: size, height: size, flexShrink: 0 }}>
+      <svg width={size} height={size} style={{ transform: "rotate(-90deg)" }}>
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="4" />
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={band.color} strokeWidth="4"
+          strokeDasharray={circ} strokeDashoffset={offset} strokeLinecap="round"
+          style={{ transition: "stroke-dashoffset 1s ease" }} />
+      </svg>
+      <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <span style={{ fontSize: size > 56 ? 14 : 11, fontWeight: 700, color: band.color, fontFamily: "'DM Mono', monospace" }}>{score}</span>
+      </div>
+    </div>
+  );
+};
+
+// ─── MAIN ─────────────────────────────────────────────────────────────────────
 export default function Dashboard() {
-  const [activeView, setActiveView] = useState<"overview" | "tasks" | "people" | "tree" | "logs" | "settings">("overview");
+  const [activeView, setActiveView] = useState<"overview" | "tasks" | "people" | "tree" | "ai" | "reports" | "logs" | "settings">("overview");
   const [overview, setOverview] = useState<Overview | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [allUsers, setAllUsers] = useState<User[]>([]);
   const [tree, setTree] = useState<TreeNode[]>([]);
+  const [leaderboard, setLeaderboard] = useState<LeaderboardUser[]>([]);
+  const [aiInsights, setAiInsights] = useState<AIInsight[]>([]);
+  const [aiReport, setAiReport] = useState<any>(null);
+  const [dailyReport, setDailyReport] = useState<ReportData | null>(null);
+  const [weeklyReport, setWeeklyReport] = useState<ReportData | null>(null);
+  const [monthlyReport, setMonthlyReport] = useState<ReportData | null>(null);
+  const [apixTrend, setApixTrend] = useState<any[]>([]);
   const [logs, setLogs] = useState<ActivityLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAddUser, setShowAddUser] = useState(false);
   const [showNewTask, setShowNewTask] = useState(false);
   const [editUser, setEditUser] = useState<User | null>(null);
   const [notification, setNotification] = useState<{ msg: string; type: 'success' | 'error' } | null>(null);
-  const [logsPanelOpen, setLogsPanelOpen] = useState(true);
+  const [liveTime, setLiveTime] = useState(new Date());
+  const [taskFilter, setTaskFilter] = useState("all");
 
   const { user, logout } = useAuthStore();
   const navigate = useNavigate();
@@ -115,17 +223,31 @@ export default function Dashboard() {
   const loadData = async () => {
     try {
       setLoading(true);
-      const [ovRes, tasksRes, usersRes, treeRes, logsRes] = await Promise.all([
+      const [ov, ts, us, tr, lb, ai, aiR, dr, wr, mr, apixTr, logsRes] = await Promise.all([
         api.get("/analytics/overview").catch(() => ({ data: null })),
         api.get("/tasks").catch(() => ({ data: { data: [] } })),
         api.get("/users").catch(() => ({ data: [] })),
         api.get("/users/tree").catch(() => ({ data: [] })),
+        api.get("/analytics/leaderboard").catch(() => ({ data: [] })),
+        api.get("/ai/insights").catch(() => ({ data: [] })),
+        api.get("/ai/reports/daily").catch(() => ({ data: null })),
+        api.get("/analytics/reports?type=daily").catch(() => ({ data: null })),
+        api.get("/analytics/reports?type=weekly").catch(() => ({ data: null })),
+        api.get("/analytics/reports?type=monthly").catch(() => ({ data: null })),
+        api.get("/analytics/apix-trend").catch(() => ({ data: [] })),
         api.get("/logs").catch(() => ({ data: [] })),
       ]);
-      if (ovRes.data) setOverview(ovRes.data);
-      setTasks(tasksRes.data?.data || tasksRes.data || []);
-      setAllUsers(usersRes.data || []);
-      setTree(treeRes.data || []);
+      if (ov.data) setOverview(ov.data);
+      setTasks(ts.data?.data || ts.data || []);
+      setAllUsers(us.data || []);
+      setTree(tr.data || []);
+      setLeaderboard(lb.data || []);
+      setAiInsights(ai.data || []);
+      setAiReport(aiR.data);
+      setDailyReport(dr.data);
+      setWeeklyReport(wr.data);
+      setMonthlyReport(mr.data);
+      setApixTrend(apixTr.data || []);
       setLogs(logsRes.data || []);
     } catch (err) {
       console.error("Failed to load data", err);
@@ -136,34 +258,31 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadData();
-    const interval = setInterval(loadData, 10000);
+    const interval = setInterval(loadData, 15000);
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const t = setInterval(() => setLiveTime(new Date()), 1000);
+    return () => clearInterval(t);
   }, []);
 
   const handleLogout = () => { logout(); navigate("/login"); };
 
-  const handleDeleteUser = async (userToDelete: User) => {
-    if (userToDelete.role === 'admin') {
-      showNotif("Admin user can't be deleted.", 'error');
-      return;
-    }
-    if (!confirm(`Delete ${userToDelete.name}? They'll be deactivated, and their reports will move up.`)) return;
+  const handleDeleteUser = async (u: User) => {
+    if (u.role === 'admin') { showNotif("Admin can't be deleted", 'error'); return; }
+    if (!confirm(`Delete ${u.name}?`)) return;
     try {
-      await api.delete(`/users/${userToDelete.id}`);
-      showNotif(`${userToDelete.name} deactivated`);
+      await api.delete(`/users/${u.id}`);
+      showNotif(`${u.name} deactivated`);
       loadData();
-    } catch (err: any) {
-      showNotif(err.response?.data?.message || "Failed to delete", 'error');
-    }
+    } catch (err: any) { showNotif(err.response?.data?.message || "Failed", 'error'); }
   };
 
   const handleClearLogs = async () => {
     if (!confirm("Clear all logs?")) return;
-    try {
-      await api.delete("/logs");
-      showNotif("Logs cleared");
-      setLogs([]);
-    } catch { showNotif("Failed", 'error'); }
+    try { await api.delete("/logs"); showNotif("Logs cleared"); setLogs([]); }
+    catch { showNotif("Failed", 'error'); }
   };
 
   const formatTime = (iso: string) => {
@@ -175,9 +294,19 @@ export default function Dashboard() {
     return d.toLocaleDateString();
   };
 
-  const employees = allUsers.filter(u => u.role === "employee");
-  const managers = allUsers.filter(u => u.role === "manager" || u.role === "admin");
-  const teamSize = allUsers.filter(u => u.is_active).length;
+  const filteredTasks = taskFilter === "all" ? tasks : tasks.filter(t => t.status === taskFilter);
+  const activeUsersCount = allUsers.filter(u => u.is_active).length;
+
+  const NAV = [
+    { id: "overview" as const, icon: "⊞", label: "Overview" },
+    { id: "tasks" as const, icon: "✓", label: "Tasks" },
+    { id: "people" as const, icon: "◉", label: "People" },
+    { id: "tree" as const, icon: "🌳", label: "Org Tree" },
+    { id: "ai" as const, icon: "✦", label: "AI Insights", badge: aiInsights.filter(i => i.type === 'alert' || i.type === 'risk').length },
+    { id: "reports" as const, icon: "≡", label: "Reports" },
+    { id: "logs" as const, icon: "📊", label: "Live Logs", badge: logs.length },
+    { id: "settings" as const, icon: "⚙", label: "Settings" },
+  ];
 
   const css = `
     @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Mono:wght@400;500&family=Inter:wght@300;400;500;600&display=swap');
@@ -187,7 +316,9 @@ export default function Dashboard() {
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
     .fade-in { animation: fadeIn 0.3s ease; }
-    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    .pulse { animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
     input, select, textarea {
       background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.10);
       border-radius: 8px; color: #e2e8f0; font-family: 'Inter', sans-serif;
@@ -195,39 +326,37 @@ export default function Dashboard() {
     }
     input:focus, select:focus, textarea:focus { border-color: #22d3ee; }
     select option { background: #1a2035; }
-    .btn { padding: 7px 14px; border-radius: 8px; font-size: 13px; font-weight: 500; cursor: pointer; border: none; transition: opacity 0.2s; }
-    .btn:hover { opacity: 0.85; }
+    .btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; border-radius: 8px; font-size: 13px; font-weight: 500; cursor: pointer; border: none; transition: all 0.15s; }
+    .btn:hover { opacity: 0.85; transform: translateY(-1px); }
     .btn-primary { background: #22d3ee; color: #080c14; }
     .btn-ghost { background: rgba(255,255,255,0.06); color: #e2e8f0; border: 1px solid rgba(255,255,255,0.10); }
     .btn-danger { background: rgba(239,68,68,0.15); color: #ef4444; border: 1px solid rgba(239,68,68,0.3); }
     .btn-icon { padding: 4px 8px; font-size: 11px; }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-    .pulse-dot { animation: pulse 2s infinite; }
+    .tag { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-family: 'DM Mono', monospace; font-weight: 500; }
   `;
 
   return (
     <>
       <style dangerouslySetInnerHTML={{ __html: css }} />
       <div style={{ display: "flex", height: "100vh", overflow: "hidden", fontFamily: "'Inter', sans-serif" }}>
+        {/* SIDEBAR */}
         <aside style={{ width: 220, background: "#0e1420", borderRight: "1px solid rgba(255,255,255,0.06)", display: "flex", flexDirection: "column", flexShrink: 0 }}>
           <div style={{ padding: "20px 20px 16px", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <div style={{ width: 34, height: 34, borderRadius: 10, background: "linear-gradient(135deg, #22d3ee, #0891b2)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 800, color: "#080c14", fontFamily: "'Syne', sans-serif" }}>TF</div>
               <div>
-                <div style={{ fontFamily: "'Syne', sans-serif", fontWeight: 800, fontSize: 15 }}>TaskFlow</div>
+                <div style={{ fontFamily: "'Syne', sans-serif", fontWeight: 800, fontSize: 15, letterSpacing: "-0.3px" }}>TaskFlow</div>
                 <div style={{ fontSize: 10, color: "#22d3ee", fontFamily: "'DM Mono', monospace" }}>WhatsApp OS</div>
               </div>
             </div>
           </div>
+          <div style={{ margin: "12px 12px 4px", background: "rgba(34,211,238,0.08)", border: "1px solid rgba(34,211,238,0.15)", borderRadius: 8, padding: "8px 12px" }}>
+            <div style={{ fontSize: 10, color: "#22d3ee", fontFamily: "'DM Mono', monospace", marginBottom: 2 }}>TENANT</div>
+            <div style={{ fontSize: 12, fontWeight: 600 }}>UIC Group</div>
+            <div style={{ fontSize: 10, color: "rgba(226,232,240,0.35)" }}>{activeUsersCount} active users</div>
+          </div>
           <nav style={{ padding: "8px", flex: 1 }}>
-            {[
-              { id: "overview" as const, icon: "⊞", label: "Overview" },
-              { id: "tasks" as const, icon: "✓", label: "Tasks" },
-              { id: "people" as const, icon: "◉", label: "People" },
-              { id: "tree" as const, icon: "🌳", label: "Org Tree" },
-              { id: "logs" as const, icon: "📊", label: "Live Logs", badge: logs.length },
-              { id: "settings" as const, icon: "⚙", label: "Settings" },
-            ].map(item => (
+            {NAV.map(item => (
               <button key={item.id} onClick={() => setActiveView(item.id)} style={{
                 width: "100%", display: "flex", alignItems: "center", gap: 10, padding: "9px 12px",
                 borderRadius: 8, border: "none", cursor: "pointer", marginBottom: 2,
@@ -237,7 +366,7 @@ export default function Dashboard() {
               }}>
                 <span style={{ fontSize: 14, width: 18, textAlign: "center" }}>{item.icon}</span>
                 {item.label}
-                {item.badge ? <span style={{ marginLeft: "auto", fontSize: 10, padding: "2px 6px", background: "rgba(34,211,238,0.2)", color: "#22d3ee", borderRadius: 4 }}>{item.badge}</span> : null}
+                {item.badge ? <span style={{ marginLeft: "auto", background: item.id === "ai" ? "#ef4444" : "rgba(34,211,238,0.2)", color: item.id === "ai" ? "#fff" : "#22d3ee", borderRadius: 4, fontSize: 9, padding: "1px 5px", fontFamily: "'DM Mono', monospace" }}>{item.badge}</span> : null}
               </button>
             ))}
           </nav>
@@ -249,122 +378,179 @@ export default function Dashboard() {
                 <div style={{ fontSize: 10, color: "rgba(226,232,240,0.35)" }}>{user?.role}</div>
               </div>
             </div>
-            <button className="btn btn-ghost" onClick={handleLogout} style={{ width: "100%", fontSize: 11, padding: "5px 10px" }}>Logout</button>
+            <button className="btn btn-ghost" onClick={handleLogout} style={{ width: "100%", justifyContent: "center", fontSize: 11, padding: "5px 10px" }}>Logout</button>
           </div>
         </aside>
 
+        {/* MAIN */}
         <main style={{ flex: 1, overflow: "auto", background: "#080c14" }}>
           <header style={{ padding: "14px 24px", borderBottom: "1px solid rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, background: "rgba(8,12,20,0.92)", backdropFilter: "blur(12px)", zIndex: 10 }}>
             <div>
-              <h1 style={{ fontFamily: "'Syne', sans-serif", fontSize: 18, fontWeight: 700 }}>
+              <h1 style={{ fontFamily: "'Syne', sans-serif", fontSize: 18, fontWeight: 700, letterSpacing: "-0.3px" }}>
                 {activeView === "overview" && "Dashboard Overview"}
                 {activeView === "tasks" && "Task Management"}
-                {activeView === "people" && "People Management"}
+                {activeView === "people" && "People & Performance"}
                 {activeView === "tree" && "Organization Tree"}
+                {activeView === "ai" && "AI Insights & Reports"}
+                {activeView === "reports" && "Analytics Reports"}
                 {activeView === "logs" && "Live Activity Logs"}
                 {activeView === "settings" && "Settings"}
               </h1>
-              <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", marginTop: 2, display: "flex", alignItems: "center", gap: 6 }}>
-                <span className="pulse-dot" style={{ display: "inline-block", width: 6, height: 6, background: "#10b981", borderRadius: "50%" }}></span>
-                Live · {teamSize} active users
+              <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", marginTop: 2 }}>
+                {liveTime.toLocaleDateString("en-IN", { weekday: "short", day: "2-digit", month: "short", year: "numeric" })} · {liveTime.toLocaleTimeString()}
               </div>
             </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              <button className="btn btn-ghost" onClick={loadData}>↻ Refresh</button>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, background: "rgba(16,185,129,0.1)", border: "1px solid rgba(16,185,129,0.2)", borderRadius: 8, padding: "5px 10px" }}>
+                <span className="pulse" style={{ width: 6, height: 6, borderRadius: "50%", background: "#10b981", display: "block" }} />
+                <span style={{ fontSize: 11, color: "#10b981", fontFamily: "'DM Mono', monospace" }}>{activeUsersCount} online</span>
+              </div>
+              <button className="btn btn-ghost" onClick={loadData}>↻</button>
               {(activeView === "people" || activeView === "tree") && <button className="btn btn-primary" onClick={() => setShowAddUser(true)}>+ Add User</button>}
               {activeView === "tasks" && <button className="btn btn-primary" onClick={() => setShowNewTask(true)}>+ New Task</button>}
-              {activeView === "logs" && <button className="btn btn-danger" onClick={handleClearLogs}>🗑 Clear Logs</button>}
+              {activeView === "logs" && <button className="btn btn-danger" onClick={handleClearLogs}>🗑 Clear</button>}
             </div>
           </header>
 
           <div className="fade-in" style={{ padding: 24 }}>
-            {/* OVERVIEW */}
+
+            {/* ─── OVERVIEW ─── */}
             {activeView === "overview" && overview && (
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12 }}>
-                {[
-                  { label: "Total Tasks", value: overview.total_tasks || 0, color: "#22d3ee" },
-                  { label: "Open Tasks", value: overview.open_tasks || 0, color: "#3b82f6" },
-                  { label: "Completed", value: overview.completed_tasks || 0, color: "#10b981" },
-                  { label: "Overdue", value: overview.overdue_tasks || 0, color: "#ef4444" },
-                  { label: "Active Users", value: teamSize, color: "#f59e0b" },
-                ].map((kpi, i) => (
-                  <div key={i} style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 16 }}>
-                    <div style={{ fontSize: 10, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>{kpi.label}</div>
-                    <div style={{ fontSize: 28, fontWeight: 800, color: kpi.color, fontFamily: "'Syne', sans-serif", marginTop: 6 }}>{kpi.value}</div>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* ORG TREE */}
-            {activeView === "tree" && (
-              <div>
-                <div style={{ background: "rgba(34,211,238,0.05)", border: "1px solid rgba(34,211,238,0.2)", borderRadius: 10, padding: 14, marginBottom: 16 }}>
-                  <div style={{ fontSize: 13, color: "#22d3ee", fontWeight: 600, marginBottom: 4 }}>🌳 Organization Hierarchy</div>
-                  <div style={{ fontSize: 12, color: "rgba(226,232,240,0.7)" }}>
-                    Each manager can only assign tasks to their team (anyone reporting to them, directly or indirectly).
-                    Click ✎ on any user to change who they report to.
-                  </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+                {/* KPI Cards */}
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12 }}>
+                  {[
+                    { label: "Total Tasks", value: overview.total_tasks, icon: "✓", color: "#22d3ee", sub: "All time" },
+                    { label: "Open Tasks", value: overview.open_tasks, icon: "◐", color: "#3b82f6", sub: "Active now" },
+                    { label: "Completed", value: overview.completed_tasks, icon: "●", color: "#10b981", sub: `+${overview.completed_today} today` },
+                    { label: "Overdue", value: overview.overdue_tasks, icon: "!", color: "#ef4444", sub: "Needs action" },
+                    { label: "Team APIX", value: `${overview.team_apix}%`, icon: "✦", color: "#f59e0b", sub: `${overview.apix_delta >= 0 ? '+' : ''}${overview.apix_delta} vs last wk` },
+                  ].map((kpi, i) => (
+                    <div key={i} style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 16, position: "relative" }}>
+                      <div style={{ position: "absolute", top: 12, right: 14, width: 32, height: 32, borderRadius: 8, background: `${kpi.color}15`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: kpi.color }}>{kpi.icon}</div>
+                      <div style={{ fontSize: 10, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>{kpi.label}</div>
+                      <div style={{ fontSize: 28, fontWeight: 800, color: kpi.color, fontFamily: "'Syne', sans-serif", marginTop: 6, letterSpacing: "-1px" }}>{kpi.value}</div>
+                      <div style={{ fontSize: 10, color: "rgba(226,232,240,0.35)", marginTop: 4 }}>{kpi.sub}</div>
+                    </div>
+                  ))}
                 </div>
-                {tree.length === 0 ? (
-                  <div style={{ textAlign: "center", padding: 60, color: "rgba(226,232,240,0.5)", background: "#0e1420", borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)" }}>
-                    <div style={{ fontSize: 14, marginBottom: 8 }}>No tree yet</div>
-                    <div style={{ fontSize: 12 }}>Add users to build organization tree</div>
-                  </div>
-                ) : (
+
+                {/* Charts row */}
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 16 }}>
                   <div style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 20 }}>
-                    {tree.map(node => (
-                      <TreeNodeView key={node.id} node={node} depth={0} allUsers={allUsers} onEdit={u => setEditUser(u)} onDelete={u => handleDeleteUser(u)} />
-                    ))}
+                    <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1, marginBottom: 12 }}>Weekly Productivity</div>
+                    <div style={{ marginBottom: 8 }}>
+                      <span style={{ fontSize: 24, fontWeight: 800, color: "#22d3ee", fontFamily: "'Syne', sans-serif" }}>{overview.team_apix}%</span>
+                      <span style={{ fontSize: 11, color: overview.apix_delta >= 0 ? "#10b981" : "#ef4444", marginLeft: 6 }}>{overview.apix_delta >= 0 ? '↑' : '↓'} {Math.abs(overview.apix_delta)}</span>
+                    </div>
+                    <BarChart data={overview.weekly_trend} />
                   </div>
-                )}
-              </div>
-            )}
 
-            {/* PEOPLE (table) */}
-            {activeView === "people" && (
-              <div>
-                <div style={{ fontSize: 12, color: "rgba(226,232,240,0.5)", marginBottom: 12 }}>
-                  Total: <strong style={{ color: "#22d3ee" }}>{allUsers.length}</strong> · Managers: <strong style={{ color: "#f59e0b" }}>{managers.length}</strong> · Employees: <strong style={{ color: "#10b981" }}>{employees.length}</strong>
-                </div>
-                <div style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, overflow: "hidden" }}>
-                  <div style={{ display: "grid", gridTemplateColumns: "2fr 1.2fr 1.2fr 0.8fr 1fr 0.8fr 90px", padding: "12px 18px", gap: 12, borderBottom: "1px solid rgba(255,255,255,0.06)", background: "rgba(255,255,255,0.02)", fontSize: 10, color: "rgba(226,232,240,0.5)", fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>
-                    <div>Name</div>
-                    <div>Phone</div>
-                    <div>Reports To</div>
-                    <div>Role</div>
-                    <div>Tasks (Done/Total)</div>
-                    <div>Status</div>
-                    <div style={{ textAlign: "right" }}>Actions</div>
+                  <div style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 20 }}>
+                    <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1, marginBottom: 14 }}>Top Performers</div>
+                    {leaderboard.length === 0 ? (
+                      <div style={{ fontSize: 12, color: "rgba(226,232,240,0.4)", textAlign: "center", padding: 20 }}>No data yet</div>
+                    ) : leaderboard.slice(0, 4).map((emp, i) => {
+                      const band = APIX_BAND(emp.apix);
+                      return (
+                        <div key={emp.id} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+                          <span style={{ fontSize: 10, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", width: 14 }}>#{i + 1}</span>
+                          <div style={{ width: 26, height: 26, borderRadius: "50%", background: `linear-gradient(135deg, ${band.color}66, ${band.color}33)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontWeight: 700, color: band.color }}>{emp.initials}</div>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 12, fontWeight: 600 }}>{emp.first_name}</div>
+                            <div style={{ height: 3, background: "rgba(255,255,255,0.06)", borderRadius: 2, marginTop: 3 }}>
+                              <div style={{ height: "100%", width: `${emp.apix}%`, background: band.color, borderRadius: 2 }} />
+                            </div>
+                          </div>
+                          <span style={{ fontSize: 11, fontWeight: 700, color: band.color, fontFamily: "'DM Mono', monospace" }}>{emp.apix}</span>
+                        </div>
+                      );
+                    })}
                   </div>
-                  {allUsers.map(u => {
-                    const role = ROLE_CONFIG[u.role] || ROLE_CONFIG.employee;
-                    const manager = u.reports_to ? allUsers.find(x => x.id === u.reports_to) : null;
-                    return (
-                      <div key={u.id} style={{ display: "grid", gridTemplateColumns: "2fr 1.2fr 1.2fr 0.8fr 1fr 0.8fr 90px", padding: "14px 18px", gap: 12, borderBottom: "1px solid rgba(255,255,255,0.04)", alignItems: "center", fontSize: 13 }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                          <div style={{ width: 32, height: 32, borderRadius: "50%", background: `${role.color}20`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, flexShrink: 0 }}>{role.icon}</div>
-                          <div style={{ minWidth: 0 }}>
-                            <div style={{ fontWeight: 600 }}>{u.name}</div>
-                            <div style={{ fontSize: 10, color: "rgba(226,232,240,0.4)" }}>{u.designation || u.email}</div>
+
+                  <div style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 20 }}>
+                    <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1, marginBottom: 14 }}>Task Status Breakdown</div>
+                    {[
+                      { label: "In Progress", count: overview.status_breakdown.in_progress, color: "#f59e0b" },
+                      { label: "Completed", count: overview.status_breakdown.completed, color: "#10b981" },
+                      { label: "Overdue", count: overview.status_breakdown.overdue, color: "#ef4444" },
+                      { label: "Assigned", count: overview.status_breakdown.assigned, color: "#64748b" },
+                    ].map((s, i) => {
+                      const totalForPct = Math.max(overview.total_tasks, 1);
+                      const pct = (s.count / totalForPct) * 100;
+                      return (
+                        <div key={i} style={{ marginBottom: 10 }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                            <span style={{ fontSize: 11, color: "rgba(226,232,240,0.6)" }}>{s.label}</span>
+                            <span style={{ fontSize: 11, fontFamily: "'DM Mono', monospace", color: s.color }}>{s.count}</span>
+                          </div>
+                          <div style={{ height: 4, background: "rgba(255,255,255,0.06)", borderRadius: 2 }}>
+                            <div style={{ height: "100%", width: `${Math.min(pct, 100)}%`, background: s.color, borderRadius: 2, transition: "width 1s ease" }} />
                           </div>
                         </div>
-                        <div style={{ fontSize: 12, fontFamily: "'DM Mono', monospace", color: "rgba(226,232,240,0.7)" }}>{u.phone}</div>
-                        <div style={{ fontSize: 12, color: manager ? "#22d3ee" : "rgba(226,232,240,0.3)" }}>
-                          {manager ? manager.name : '— root —'}
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Recent Activity */}
+                <div style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 20 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+                    <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Recent WhatsApp Activity</div>
+                    <span style={{ fontSize: 10, color: "#22d3ee", cursor: "pointer" }} onClick={() => setActiveView("logs")}>View all →</span>
+                  </div>
+                  {overview.recent_activity.length === 0 ? (
+                    <div style={{ fontSize: 12, color: "rgba(226,232,240,0.4)", textAlign: "center", padding: 20 }}>No activity yet — wait for WhatsApp messages</div>
+                  ) : (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                      {overview.recent_activity.map((act, i) => (
+                        <div key={i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", background: "rgba(255,255,255,0.02)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)" }}>
+                          <div style={{ width: 30, height: 30, borderRadius: "50%", background: `${act.color}22`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: act.color, flexShrink: 0 }}>{act.user_initials}</div>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <span style={{ fontSize: 12, fontWeight: 600 }}>{act.user_name}</span>
+                            <span style={{ fontSize: 12, color: "rgba(226,232,240,0.35)" }}> {act.action} </span>
+                            <span style={{ fontSize: 12, color: act.color }}>{act.task_title}</span>
+                          </div>
+                          <span style={{ fontSize: 10, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", whiteSpace: "nowrap" }}>{act.time}</span>
                         </div>
-                        <div><span style={{ padding: "2px 8px", borderRadius: 4, fontSize: 10, background: `${role.color}15`, color: role.color, fontFamily: "'DM Mono', monospace", border: `1px solid ${role.color}30` }}>{role.label}</span></div>
-                        <div style={{ fontSize: 12, fontFamily: "'DM Mono', monospace" }}>
-                          <span style={{ color: "#10b981" }}>{u.stats?.completed || 0}</span>
-                          <span style={{ color: "rgba(226,232,240,0.3)" }}>/</span>
-                          <span>{u.stats?.total_assigned || 0}</span>
-                          {(u.stats?.overdue || 0) > 0 && <span style={{ color: "#ef4444", marginLeft: 8 }}>⚠ {u.stats?.overdue}</span>}
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* ─── TASKS ─── */}
+            {activeView === "tasks" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  {["all", "in_progress", "assigned", "completed", "overdue", "escalated"].map(f => (
+                    <button key={f} onClick={() => setTaskFilter(f)} className="tag" style={{
+                      cursor: "pointer", border: `1px solid ${taskFilter === f ? "#22d3ee" : "rgba(255,255,255,0.10)"}`,
+                      background: taskFilter === f ? "rgba(34,211,238,0.1)" : "rgba(255,255,255,0.03)",
+                      color: taskFilter === f ? "#22d3ee" : "rgba(226,232,240,0.6)",
+                      padding: "6px 14px", fontSize: 12,
+                    }}>
+                      {f === "all" ? "All" : STATUS_CONFIG[f]?.label || f}
+                      {f === "all" && <span style={{ marginLeft: 4, color: "rgba(226,232,240,0.35)" }}>{tasks.length}</span>}
+                    </button>
+                  ))}
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {filteredTasks.length === 0 ? (
+                    <div style={{ textAlign: "center", padding: 60, color: "rgba(226,232,240,0.5)", background: "#0e1420", borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)" }}>
+                      No tasks
+                    </div>
+                  ) : filteredTasks.map(task => {
+                    const sc = STATUS_CONFIG[task.status] || STATUS_CONFIG.assigned;
+                    return (
+                      <div key={task.id} style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: "14px 18px", display: "flex", alignItems: "center", gap: 16 }}>
+                        <span className="tag" style={{ background: sc.bg, color: sc.color, border: `1px solid ${sc.color}40`, width: 88, justifyContent: "center" }}>{sc.label}</span>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 2 }}>{task.title}</div>
+                          <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)" }}>{task.assigned_to?.name || "Unassigned"} · From {task.assigned_by?.name || "—"} · T-{task.id.substring(0, 6)}</div>
                         </div>
-                        <div><span style={{ padding: "2px 8px", borderRadius: 4, fontSize: 10, background: u.is_active ? "rgba(16,185,129,0.15)" : "rgba(100,116,139,0.15)", color: u.is_active ? "#10b981" : "#64748b" }}>{u.is_active ? "Active" : "Inactive"}</span></div>
-                        <div style={{ display: "flex", gap: 4, justifyContent: "flex-end" }}>
-                          <button className="btn btn-ghost btn-icon" onClick={() => setEditUser(u)}>✎</button>
-                          {u.role !== 'admin' && <button className="btn btn-danger btn-icon" onClick={() => handleDeleteUser(u)}>🗑</button>}
-                        </div>
+                        <div style={{ fontSize: 12, color: "#f59e0b", fontFamily: "'DM Mono', monospace" }}>⭐ {task.reward_points}</div>
                       </div>
                     );
                   })}
@@ -372,33 +558,170 @@ export default function Dashboard() {
               </div>
             )}
 
-            {/* TASKS */}
-            {activeView === "tasks" && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {tasks.length === 0 ? (
-                  <div style={{ textAlign: "center", padding: 60, color: "rgba(226,232,240,0.5)", background: "#0e1420", borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)" }}>
-                    <div style={{ fontSize: 14, marginBottom: 8 }}>No tasks yet</div>
-                    <div style={{ fontSize: 12 }}>Send "ASSIGN &lt;name&gt; &lt;task&gt;" via WhatsApp to create one</div>
-                  </div>
-                ) : tasks.map(task => {
-                  const sc = STATUS_CONFIG[task.status] || STATUS_CONFIG.assigned;
+            {/* ─── PEOPLE ─── */}
+            {activeView === "people" && (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14 }}>
+                {allUsers.map(u => {
+                  const role = ROLE_CONFIG[u.role] || ROLE_CONFIG.employee;
+                  const lb = leaderboard.find(l => l.id === u.id);
+                  const apix = lb?.apix || 0;
+                  const band = APIX_BAND(apix);
                   return (
-                    <div key={task.id} style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: "14px 18px", display: "flex", alignItems: "center", gap: 16 }}>
-                      <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: 11, fontFamily: "'DM Mono', monospace", background: sc.bg, color: sc.color, border: `1px solid ${sc.color}40`, minWidth: 88, textAlign: "center" }}>{sc.label}</span>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 2 }}>{task.title}</div>
-                        <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)" }}>
-                          {task.assigned_to?.name || "Unassigned"} · From {task.assigned_by?.name || "—"} · T-{task.id.substring(0, 6)}
+                    <div key={u.id} style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 14, padding: 18 }}>
+                      <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+                        <div style={{ width: 44, height: 44, borderRadius: "50%", background: `linear-gradient(135deg, ${role.color}44, ${role.color}22)`, border: `2px solid ${role.color}55`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>{role.icon}</div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 700 }}>{u.name}</div>
+                          <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", marginTop: 1 }}>{u.designation || ucfirst(u.role)}</div>
+                          <div style={{ fontSize: 10, color: "rgba(226,232,240,0.35)", marginTop: 2, fontFamily: "'DM Mono', monospace" }}>{u.phone}</div>
                         </div>
+                        {apix > 0 && <APIXRing score={apix} size={54} />}
                       </div>
-                      <div style={{ fontSize: 12, color: "#f59e0b", fontFamily: "'DM Mono', monospace" }}>⭐ {task.reward_points}</div>
+                      <div style={{ marginTop: 14, display: "flex", gap: 6, alignItems: "center" }}>
+                        <span className="tag" style={{ background: `${band.color}15`, color: band.color, border: `1px solid ${band.color}30` }}>{band.label}</span>
+                        {u.stats && <span style={{ fontSize: 10, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", marginLeft: "auto" }}>{u.stats.completed}/{u.stats.total_assigned} tasks</span>}
+                      </div>
+                      <div style={{ marginTop: 10, display: "flex", gap: 6 }}>
+                        <button className="btn btn-ghost btn-icon" onClick={() => setEditUser(u)} style={{ flex: 1, justifyContent: "center" }}>✎ Edit</button>
+                        {u.role !== 'admin' && <button className="btn btn-danger btn-icon" onClick={() => handleDeleteUser(u)} style={{ flex: 1, justifyContent: "center" }}>🗑 Delete</button>}
+                      </div>
                     </div>
                   );
                 })}
               </div>
             )}
 
-            {/* LOGS */}
+            {/* ─── ORG TREE ─── */}
+            {activeView === "tree" && (
+              <div>
+                <div style={{ background: "rgba(34,211,238,0.05)", border: "1px solid rgba(34,211,238,0.2)", borderRadius: 10, padding: 14, marginBottom: 16 }}>
+                  <div style={{ fontSize: 13, color: "#22d3ee", fontWeight: 600, marginBottom: 4 }}>🌳 Organization Hierarchy</div>
+                  <div style={{ fontSize: 12, color: "rgba(226,232,240,0.7)" }}>Managers can only assign tasks to their sub-tree. Click ✎ to change reporting.</div>
+                </div>
+                {tree.length === 0 ? (
+                  <div style={{ textAlign: "center", padding: 60, color: "rgba(226,232,240,0.5)", background: "#0e1420", borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)" }}>No tree yet</div>
+                ) : (
+                  <div style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 20 }}>
+                    {tree.map(node => <TreeNodeView key={node.id} node={node} depth={0} onEdit={u => setEditUser(u)} onDelete={u => handleDeleteUser(u)} />)}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ─── AI INSIGHTS ─── */}
+            {activeView === "ai" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 14 }}>
+                  {aiInsights.length === 0 ? (
+                    <div style={{ gridColumn: "span 2", textAlign: "center", padding: 40, color: "rgba(226,232,240,0.5)", background: "#0e1420", borderRadius: 12 }}>No insights yet</div>
+                  ) : aiInsights.map((ins, i) => {
+                    const colors: any = { alert: "#f59e0b", risk: "#ef4444", star: "#10b981", insight: "#3b82f6" };
+                    const c = colors[ins.type] || "#3b82f6";
+                    return (
+                      <div key={i} style={{ background: "#0e1420", border: `1px solid ${c}22`, borderLeft: `3px solid ${c}`, borderRadius: "0 12px 12px 0", padding: 18, display: "flex", gap: 14 }}>
+                        <span style={{ fontSize: 22 }}>{ins.icon}</span>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 4 }}>{ins.title}</div>
+                          <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", lineHeight: 1.5, marginBottom: 10 }}>{ins.desc}</div>
+                          <button className="btn" onClick={() => showNotif(`Action: ${ins.action}`)} style={{ fontSize: 11, padding: "5px 12px", background: `${c}15`, color: c, border: `1px solid ${c}30` }}>{ins.action}</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* APIX Formula */}
+                <div style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 20 }}>
+                  <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1, marginBottom: 16 }}>APIX Score Formula</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12 }}>
+                    {[
+                      { label: "Completion\nRate", weight: "30%", formula: "Done/Assigned × 100", color: "#22d3ee" },
+                      { label: "Timeliness", weight: "25%", formula: "Avg per-task timing", color: "#10b981" },
+                      { label: "AI Quality", weight: "20%", formula: "AI evaluates updates", color: "#a78bfa" },
+                      { label: "Consistency", weight: "15%", formula: "Active days / working", color: "#f59e0b" },
+                      { label: "Manager\nRating", weight: "10%", formula: "Direct rating", color: "#f97316" },
+                    ].map((c, i) => (
+                      <div key={i} style={{ textAlign: "center", background: `${c.color}08`, border: `1px solid ${c.color}20`, borderRadius: 10, padding: 14 }}>
+                        <div style={{ fontSize: 20, fontWeight: 800, color: c.color, fontFamily: "'Syne', sans-serif" }}>{c.weight}</div>
+                        <div style={{ fontSize: 10, fontWeight: 600, marginTop: 4, whiteSpace: "pre-line" }}>{c.label}</div>
+                        <div style={{ fontSize: 9, color: "rgba(226,232,240,0.35)", marginTop: 6, lineHeight: 1.4 }}>{c.formula}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ marginTop: 16, padding: "12px 16px", background: "rgba(255,255,255,0.03)", borderRadius: 8 }}>
+                    <code style={{ fontSize: 12, color: "#a78bfa", fontFamily: "'DM Mono', monospace" }}>
+                      APIX = (CR × 0.30) + (TS × 0.25) + (QS × 0.20) + (CS × 0.15) + (MR × 0.10)
+                    </code>
+                  </div>
+                </div>
+
+                {/* Today's AI Report */}
+                {aiReport && (
+                  <div style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 20 }}>
+                    <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1, marginBottom: 16 }}>Today's AI Report · {new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "short" })}</div>
+                    <div style={{ fontSize: 12, color: "rgba(226,232,240,0.6)", lineHeight: 2 }}>
+                      <div><span style={{ color: "#22d3ee", fontFamily: "'DM Mono', monospace" }}>TASKS:</span> {aiReport.tasks_line}</div>
+                      <div><span style={{ color: "#10b981", fontFamily: "'DM Mono', monospace" }}>TOP PERFORMER:</span> {aiReport.top_performer}</div>
+                      <div><span style={{ color: "#f59e0b", fontFamily: "'DM Mono', monospace" }}>AT RISK:</span> {aiReport.at_risk}</div>
+                      <div><span style={{ color: "#ef4444", fontFamily: "'DM Mono', monospace" }}>ACTION NEEDED:</span> {aiReport.action_needed}</div>
+                      <div><span style={{ color: "#a78bfa", fontFamily: "'DM Mono', monospace" }}>SUGGESTION:</span> {aiReport.suggestion}</div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ─── REPORTS ─── */}
+            {activeView === "reports" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14 }}>
+                  {[
+                    { type: "Daily", data: dailyReport, icon: "📋" },
+                    { type: "Weekly", data: weeklyReport, icon: "📊" },
+                    { type: "Monthly", data: monthlyReport, icon: "📈" },
+                  ].map((r, i) => (
+                    <div key={i} style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 20 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
+                        <div>
+                          <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{r.type} Report</div>
+                          <div style={{ fontSize: 13, fontWeight: 700, marginTop: 4 }}>{r.data?.label || "—"}</div>
+                        </div>
+                        <span style={{ fontSize: 20 }}>{r.icon}</span>
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 16 }}>
+                        {r.data?.stats && Object.entries(r.data.stats).map(([key, value]) => (
+                          <div key={key} style={{ display: "flex", justifyContent: "space-between" }}>
+                            <span style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", textTransform: "capitalize" }}>{key.replace(/_/g, ' ')}</span>
+                            <span style={{ fontSize: 11, fontFamily: "'DM Mono', monospace" }}>{String(value)}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <button className="btn btn-ghost" style={{ width: "100%", justifyContent: "center" }} onClick={() => showNotif(`${r.type} report generated`)}>Generate & Share</button>
+                    </div>
+                  ))}
+                </div>
+
+                {/* APIX Trend */}
+                {apixTrend.length > 0 && (
+                  <div style={{ background: "#0e1420", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 12, padding: 20 }}>
+                    <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1, marginBottom: 16 }}>Team APIX Trend — Last 7 Days</div>
+                    <div style={{ display: "flex", gap: 24 }}>
+                      {apixTrend.map((t, i) => {
+                        const colors = ["#22d3ee", "#10b981", "#f59e0b"];
+                        return (
+                          <div key={i} style={{ flex: 1 }}>
+                            <div style={{ fontSize: 11, color: colors[i], marginBottom: 6, fontFamily: "'DM Mono', monospace" }}>{t.first_name}</div>
+                            <SparkLine data={t.history} color={colors[i]} />
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ─── LOGS ─── */}
             {activeView === "logs" && (
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                 {logs.length === 0 ? (
@@ -409,10 +732,10 @@ export default function Dashboard() {
                     <div key={log.id} style={{ background: "#0e1420", borderLeft: `3px solid ${color}`, border: "1px solid rgba(255,255,255,0.06)", borderRadius: 8, padding: "12px 16px" }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
                         <span>{LOG_ICON(log.type, log.status)}</span>
-                        <span style={{ fontSize: 10, padding: "2px 6px", background: `${color}20`, color: color, borderRadius: 4, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{log.type}</span>
+                        <span style={{ fontSize: 10, padding: "2px 6px", background: `${color}20`, color, borderRadius: 4, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>{log.type}</span>
                         <span style={{ marginLeft: "auto", fontSize: 10, color: "rgba(226,232,240,0.4)", fontFamily: "'DM Mono', monospace" }}>{formatTime(log.created_at)}</span>
                       </div>
-                      <div style={{ fontSize: 13, color: "#e2e8f0", marginLeft: 24 }}>{log.message}</div>
+                      <div style={{ fontSize: 13, marginLeft: 24 }}>{log.message}</div>
                       {log.phone && <div style={{ fontSize: 11, color: "rgba(226,232,240,0.5)", marginLeft: 24, marginTop: 2, fontFamily: "'DM Mono', monospace" }}>📱 {log.phone}</div>}
                     </div>
                   );
@@ -432,71 +755,31 @@ export default function Dashboard() {
             )}
           </div>
         </main>
-
-        {/* Side logs panel */}
-        {activeView !== "logs" && logsPanelOpen && (
-          <aside style={{ width: 320, background: "#0a0f18", borderLeft: "1px solid rgba(255,255,255,0.06)", display: "flex", flexDirection: "column", flexShrink: 0 }}>
-            <div style={{ padding: "14px 16px", borderBottom: "1px solid rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <div>
-                <div style={{ fontSize: 13, fontWeight: 600 }}>📊 Live Logs</div>
-                <div style={{ fontSize: 9, color: "rgba(226,232,240,0.4)", fontFamily: "'DM Mono', monospace", marginTop: 2 }}>{logs.length} events · 10s refresh</div>
-              </div>
-              <button onClick={() => setLogsPanelOpen(false)} style={{ background: "transparent", border: "none", color: "rgba(226,232,240,0.5)", cursor: "pointer", fontSize: 16 }}>×</button>
-            </div>
-            <div style={{ flex: 1, overflow: "auto", padding: 8 }}>
-              {logs.length === 0 ? (
-                <div style={{ padding: 20, textAlign: "center", fontSize: 11, color: "rgba(226,232,240,0.4)" }}>No activity yet</div>
-              ) : logs.slice(0, 30).map(log => {
-                const color = LOG_STATUS_COLOR(log.status);
-                return (
-                  <div key={log.id} style={{ padding: "8px 10px", marginBottom: 4, borderLeft: `2px solid ${color}`, background: "rgba(255,255,255,0.02)", borderRadius: 4 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
-                      <span style={{ fontSize: 12 }}>{LOG_ICON(log.type, log.status)}</span>
-                      <span style={{ fontSize: 9, padding: "1px 5px", background: `${color}20`, color: color, borderRadius: 3, fontFamily: "'DM Mono', monospace" }}>{log.type.replace('whatsapp_', 'wa_')}</span>
-                      <span style={{ fontSize: 9, color: "rgba(226,232,240,0.4)", marginLeft: "auto" }}>{formatTime(log.created_at)}</span>
-                    </div>
-                    <div style={{ fontSize: 11, color: "#e2e8f0", lineHeight: 1.4 }}>{log.message}</div>
-                  </div>
-                );
-              })}
-            </div>
-          </aside>
-        )}
-
-        {activeView !== "logs" && !logsPanelOpen && (
-          <button onClick={() => setLogsPanelOpen(true)} style={{ position: "fixed", right: 16, top: 80, background: "#22d3ee", color: "#080c14", border: "none", borderRadius: 8, padding: "8px 12px", cursor: "pointer", fontSize: 12, fontWeight: 600, zIndex: 50 }}>📊 Show Logs ({logs.length})</button>
-        )}
       </div>
 
-      {showAddUser && <UserModal allUsers={allUsers} onClose={() => setShowAddUser(false)} onSuccess={() => { showNotif("✅ User added!"); loadData(); }} />}
+      {showAddUser && <UserModal allUsers={allUsers} onClose={() => setShowAddUser(false)} onSuccess={() => { showNotif("✅ Added!"); loadData(); }} />}
       {editUser && <UserModal user={editUser} allUsers={allUsers} onClose={() => setEditUser(null)} onSuccess={() => { showNotif("✅ Updated!"); loadData(); }} />}
       {showNewTask && <NewTaskModal employees={allUsers} onClose={() => setShowNewTask(false)} onSuccess={() => { showNotif("✅ Assigned!"); loadData(); }} />}
 
       {notification && (
-        <div style={{ position: "fixed", bottom: 24, right: 24, zIndex: 200, background: notification.type === 'success' ? "rgba(16,185,129,0.15)" : "rgba(239,68,68,0.15)", border: notification.type === 'success' ? "1px solid rgba(16,185,129,0.3)" : "1px solid rgba(239,68,68,0.3)", borderRadius: 10, padding: "12px 18px", fontSize: 13, color: "#e2e8f0", backdropFilter: "blur(12px)", maxWidth: 380 }}>{notification.msg}</div>
+        <div style={{ position: "fixed", bottom: 24, right: 24, zIndex: 200, background: notification.type === 'success' ? "rgba(16,185,129,0.15)" : "rgba(239,68,68,0.15)", border: notification.type === 'success' ? "1px solid rgba(16,185,129,0.3)" : "1px solid rgba(239,68,68,0.3)", borderRadius: 10, padding: "12px 18px", fontSize: 13, backdropFilter: "blur(12px)" }}>{notification.msg}</div>
       )}
     </>
   );
 }
 
-// Recursive tree node component
-function TreeNodeView({ node, depth, allUsers, onEdit, onDelete }: { node: TreeNode; depth: number; allUsers: User[]; onEdit: (u: User) => void; onDelete: (u: User) => void }) {
+function ucfirst(s: string) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+function TreeNodeView({ node, depth, onEdit, onDelete }: { node: TreeNode; depth: number; onEdit: (u: User) => void; onDelete: (u: User) => void }) {
   const [expanded, setExpanded] = useState(true);
   const role = ROLE_CONFIG[node.role] || ROLE_CONFIG.employee;
   const hasChildren = node.children && node.children.length > 0;
 
   return (
     <div style={{ marginLeft: depth > 0 ? 24 : 0, marginBottom: 4 }}>
-      <div style={{
-        display: "flex", alignItems: "center", gap: 12, padding: "10px 14px",
-        background: depth === 0 ? "rgba(34,211,238,0.05)" : "rgba(255,255,255,0.02)",
-        borderRadius: 10,
-        border: `1px solid ${depth === 0 ? "rgba(34,211,238,0.2)" : "rgba(255,255,255,0.04)"}`,
-      }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", background: depth === 0 ? "rgba(34,211,238,0.05)" : "rgba(255,255,255,0.02)", borderRadius: 10, border: `1px solid ${depth === 0 ? "rgba(34,211,238,0.2)" : "rgba(255,255,255,0.04)"}` }}>
         {hasChildren ? (
-          <button onClick={() => setExpanded(!expanded)} style={{ background: "transparent", border: "none", color: "rgba(226,232,240,0.6)", cursor: "pointer", fontSize: 12, width: 18 }}>
-            {expanded ? '▼' : '▶'}
-          </button>
+          <button onClick={() => setExpanded(!expanded)} style={{ background: "transparent", border: "none", color: "rgba(226,232,240,0.6)", cursor: "pointer", fontSize: 12, width: 18 }}>{expanded ? '▼' : '▶'}</button>
         ) : (
           <span style={{ width: 18, fontSize: 10, color: "rgba(226,232,240,0.2)", textAlign: "center" }}>·</span>
         )}
@@ -505,11 +788,8 @@ function TreeNodeView({ node, depth, allUsers, onEdit, onDelete }: { node: TreeN
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <span style={{ fontWeight: 600, fontSize: 13 }}>{node.name}</span>
             <span style={{ padding: "1px 6px", borderRadius: 3, fontSize: 9, background: `${role.color}15`, color: role.color, fontFamily: "'DM Mono', monospace" }}>{role.label}</span>
-            {node.designation && <span style={{ fontSize: 11, color: "rgba(226,232,240,0.5)" }}>· {node.designation}</span>}
           </div>
-          <div style={{ fontSize: 10, color: "rgba(226,232,240,0.4)", fontFamily: "'DM Mono', monospace", marginTop: 2 }}>
-            {node.phone}
-          </div>
+          <div style={{ fontSize: 10, color: "rgba(226,232,240,0.4)", fontFamily: "'DM Mono', monospace", marginTop: 2 }}>{node.phone}</div>
         </div>
         <div style={{ display: "flex", gap: 16, fontSize: 11, fontFamily: "'DM Mono', monospace" }}>
           <div style={{ textAlign: "center" }}>
@@ -526,12 +806,6 @@ function TreeNodeView({ node, depth, allUsers, onEdit, onDelete }: { node: TreeN
               <div style={{ color: "#ef4444", fontWeight: 600 }}>{node.stats.overdue}</div>
             </div>
           )}
-          {hasChildren && (
-            <div style={{ textAlign: "center" }}>
-              <div style={{ color: "rgba(226,232,240,0.4)", fontSize: 9 }}>REPORTS</div>
-              <div style={{ color: "#22d3ee", fontWeight: 600 }}>{node.children.length}</div>
-            </div>
-          )}
         </div>
         <div style={{ display: "flex", gap: 4 }}>
           <button className="btn btn-ghost btn-icon" onClick={() => onEdit(node)}>✎</button>
@@ -540,9 +814,7 @@ function TreeNodeView({ node, depth, allUsers, onEdit, onDelete }: { node: TreeN
       </div>
       {expanded && hasChildren && (
         <div style={{ marginTop: 4, paddingLeft: 8, borderLeft: "1px dashed rgba(255,255,255,0.08)" }}>
-          {node.children.map(child => (
-            <TreeNodeView key={child.id} node={child} depth={depth + 1} allUsers={allUsers} onEdit={onEdit} onDelete={onDelete} />
-          ))}
+          {node.children.map(child => <TreeNodeView key={child.id} node={child} depth={depth + 1} onEdit={onEdit} onDelete={onDelete} />)}
         </div>
       )}
     </div>
@@ -562,22 +834,16 @@ function UserModal({ user, allUsers, onClose, onSuccess }: { user?: User; allUse
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
-  // Possible managers = all admins + managers EXCEPT current user (can't report to self)
-  const possibleManagers = allUsers.filter(u =>
-    (u.role === 'admin' || u.role === 'manager') && u.is_active && u.id !== user?.id
-  );
+  const possibleManagers = allUsers.filter(u => (u.role === 'admin' || u.role === 'manager') && u.is_active && u.id !== user?.id);
 
   const handleSubmit = async () => {
     setError("");
-    if (!name.trim()) { setError("Name required"); return; }
-    if (!phone.trim()) { setError("Phone required"); return; }
-
+    if (!name.trim() || !phone.trim()) { setError("Name and phone required"); return; }
     let cleanPhone = phone.replace(/[\s\-()]/g, '');
     if (!cleanPhone.startsWith('+')) {
       if (cleanPhone.length === 10) cleanPhone = '+91' + cleanPhone;
       else if (cleanPhone.startsWith('91') && cleanPhone.length === 12) cleanPhone = '+' + cleanPhone;
     }
-
     setSaving(true);
     try {
       const payload: any = { name: name.trim(), phone: cleanPhone, role };
@@ -586,50 +852,35 @@ function UserModal({ user, allUsers, onClose, onSuccess }: { user?: User; allUse
       if (email.trim()) payload.email = email.trim();
       payload.reports_to = reportsTo || null;
       if (isEdit) payload.is_active = isActive;
-
       if (isEdit) await api.put(`/users/${user!.id}`, payload);
       else await api.post("/users", payload);
-      onSuccess();
-      onClose();
+      onSuccess(); onClose();
     } catch (err: any) {
-      let errorMsg = isEdit ? "Failed to update" : "Failed to add";
-      if (err.response?.data?.message) errorMsg = err.response.data.message;
-      else if (err.response?.data?.errors) {
-        const firstError = Object.values(err.response.data.errors)[0];
-        errorMsg = Array.isArray(firstError) ? firstError[0] : String(firstError);
-      }
-      setError(errorMsg);
+      let m = isEdit ? "Failed to update" : "Failed to add";
+      if (err.response?.data?.message) m = err.response.data.message;
+      setError(m);
     } finally { setSaving(false); }
   };
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, backdropFilter: "blur(4px)" }} onClick={onClose}>
-      <div style={{ background: "#131928", border: "1px solid rgba(255,255,255,0.10)", borderRadius: 16, padding: 28, width: 480, maxHeight: "90vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
+      <div style={{ background: "#131928", border: "1px solid rgba(255,255,255,0.10)", borderRadius: 16, padding: 28, width: 480, maxHeight: "90vh", overflow: "auto" }} onClick={e => e.stopPropagation()}>
         <h2 style={{ fontFamily: "'Syne', sans-serif", fontSize: 18, fontWeight: 700, marginBottom: 4 }}>{isEdit ? `Edit ${user.name}` : "Add User"}</h2>
-        <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", marginBottom: 20 }}>{isEdit ? "Update details and reporting" : "New user will receive WhatsApp welcome"}</div>
+        <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", marginBottom: 20 }}>{isEdit ? "Update details" : "WhatsApp welcome will be sent"}</div>
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           <input placeholder="Full Name *" value={name} onChange={e => setName(e.target.value)} />
           <input placeholder="+919876543210 *" value={phone} onChange={e => setPhone(e.target.value)} />
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
             <select value={role} onChange={e => setRole(e.target.value)}>
-              <option value="employee">Employee</option>
-              <option value="manager">Manager</option>
-              <option value="admin">Admin</option>
+              <option value="employee">Employee</option><option value="manager">Manager</option><option value="admin">Admin</option>
             </select>
-            {isEdit && (
-              <select value={isActive ? "active" : "inactive"} onChange={e => setIsActive(e.target.value === "active")}>
-                <option value="active">Active</option>
-                <option value="inactive">Inactive</option>
-              </select>
-            )}
+            {isEdit && <select value={isActive ? "active" : "inactive"} onChange={e => setIsActive(e.target.value === "active")}><option value="active">Active</option><option value="inactive">Inactive</option></select>}
           </div>
           <div>
-            <label style={{ fontSize: 10, color: "rgba(226,232,240,0.5)", display: "block", marginBottom: 4, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Reports To (Manager)</label>
+            <label style={{ fontSize: 10, color: "rgba(226,232,240,0.5)", display: "block", marginBottom: 4, fontFamily: "'DM Mono', monospace", textTransform: "uppercase" }}>Reports To</label>
             <select value={reportsTo || ""} onChange={e => setReportsTo(e.target.value)}>
-              <option value="">— Root (no manager) —</option>
-              {possibleManagers.map(m => (
-                <option key={m.id} value={m.id}>{m.name} ({m.role})</option>
-              ))}
+              <option value="">— Root —</option>
+              {possibleManagers.map(m => <option key={m.id} value={m.id}>{m.name} ({m.role})</option>)}
             </select>
           </div>
           <input placeholder="Designation" value={designation} onChange={e => setDesignation(e.target.value)} />
@@ -637,8 +888,8 @@ function UserModal({ user, allUsers, onClose, onSuccess }: { user?: User; allUse
           <input placeholder="Email (optional)" value={email} onChange={e => setEmail(e.target.value)} />
           {error && <div style={{ fontSize: 12, color: "#ef4444", padding: "8px 12px", background: "rgba(239,68,68,0.1)", borderRadius: 6 }}>⚠️ {error}</div>}
           <div style={{ display: "flex", gap: 8 }}>
-            <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onClose}>Cancel</button>
-            <button className="btn btn-primary" style={{ flex: 2 }} onClick={handleSubmit} disabled={saving || !name || !phone}>{saving ? "Saving..." : (isEdit ? "Update" : "Add")}</button>
+            <button className="btn btn-ghost" style={{ flex: 1, justifyContent: "center" }} onClick={onClose}>Cancel</button>
+            <button className="btn btn-primary" style={{ flex: 2, justifyContent: "center" }} onClick={handleSubmit} disabled={saving}>{saving ? "Saving..." : (isEdit ? "Update" : "Add")}</button>
           </div>
         </div>
       </div>
@@ -659,8 +910,7 @@ function NewTaskModal({ employees, onClose, onSuccess }: { employees: User[]; on
     setError(""); setSaving(true);
     try {
       await api.post("/tasks", { title, assigned_to: assignedTo, priority, due_date: dueDate || null, reward_points: points });
-      onSuccess();
-      onClose();
+      onSuccess(); onClose();
     } catch (err: any) { setError(err.response?.data?.message || "Failed"); }
     finally { setSaving(false); }
   };
@@ -669,12 +919,12 @@ function NewTaskModal({ employees, onClose, onSuccess }: { employees: User[]; on
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, backdropFilter: "blur(4px)" }} onClick={onClose}>
       <div style={{ background: "#131928", border: "1px solid rgba(255,255,255,0.10)", borderRadius: 16, padding: 28, width: 440 }} onClick={e => e.stopPropagation()}>
         <h2 style={{ fontFamily: "'Syne', sans-serif", fontSize: 18, fontWeight: 700, marginBottom: 4 }}>New Task</h2>
-        <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", marginBottom: 20 }}>Assignee will receive WhatsApp notification</div>
+        <div style={{ fontSize: 11, color: "rgba(226,232,240,0.35)", marginBottom: 20 }}>WhatsApp will go to assignee</div>
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           <input placeholder="Task title" value={title} onChange={e => setTitle(e.target.value)} />
           <select value={assignedTo} onChange={e => setAssignedTo(e.target.value)}>
             <option value="">Select user</option>
-            {employees.map(e => <option key={e.id} value={e.id}>{e.name} ({e.role})</option>)}
+            {employees.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
           </select>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
             <select value={priority} onChange={e => setPriority(e.target.value)}>
@@ -683,10 +933,10 @@ function NewTaskModal({ employees, onClose, onSuccess }: { employees: User[]; on
             <input type="number" value={points} onChange={e => setPoints(parseInt(e.target.value) || 50)} placeholder="Points" />
           </div>
           <input type="datetime-local" value={dueDate} onChange={e => setDueDate(e.target.value)} />
-          {error && <div style={{ fontSize: 12, color: "#ef4444", padding: "8px 12px", background: "rgba(239,68,68,0.1)", borderRadius: 6 }}>⚠️ {error}</div>}
+          {error && <div style={{ fontSize: 12, color: "#ef4444", padding: "8px 12px", background: "rgba(239,68,68,0.1)", borderRadius: 6 }}>{error}</div>}
           <div style={{ display: "flex", gap: 8 }}>
-            <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onClose}>Cancel</button>
-            <button className="btn btn-primary" style={{ flex: 2 }} onClick={handleSubmit} disabled={saving || !title || !assignedTo}>{saving ? "Assigning..." : "Assign + WhatsApp"}</button>
+            <button className="btn btn-ghost" style={{ flex: 1, justifyContent: "center" }} onClick={onClose}>Cancel</button>
+            <button className="btn btn-primary" style={{ flex: 2, justifyContent: "center" }} onClick={handleSubmit} disabled={saving || !title || !assignedTo}>{saving ? "..." : "Assign + WhatsApp"}</button>
           </div>
         </div>
       </div>
