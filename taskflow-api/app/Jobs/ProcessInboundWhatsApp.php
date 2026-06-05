@@ -36,8 +36,52 @@ class ProcessInboundWhatsApp implements ShouldQueue
             $message   = $value['messages'][0];
             $phone     = $message['from'];
             $msgType   = $message['type'] ?? 'text';
-            $text      = $message['text']['body'] ?? '';
             $messageId = $message['id'];
+
+            // ── Extract text + media payload from any message type ──
+            $text          = '';
+            $mediaId       = null;
+            $mediaType     = null; // 'image', 'document', 'video', 'audio'
+            $mediaMime     = null;
+            $mediaFilename = null;
+
+            switch ($msgType) {
+                case 'text':
+                    $text = $message['text']['body'] ?? '';
+                    break;
+                case 'image':
+                    $text       = $message['image']['caption'] ?? '';
+                    $mediaId    = $message['image']['id'] ?? null;
+                    $mediaType  = 'image';
+                    $mediaMime  = $message['image']['mime_type'] ?? 'image/jpeg';
+                    break;
+                case 'document':
+                    $text          = $message['document']['caption'] ?? '';
+                    $mediaId       = $message['document']['id'] ?? null;
+                    $mediaType     = 'document';
+                    $mediaMime     = $message['document']['mime_type'] ?? 'application/octet-stream';
+                    $mediaFilename = $message['document']['filename'] ?? null;
+                    break;
+                case 'video':
+                    $text      = $message['video']['caption'] ?? '';
+                    $mediaId   = $message['video']['id'] ?? null;
+                    $mediaType = 'video';
+                    $mediaMime = $message['video']['mime_type'] ?? 'video/mp4';
+                    break;
+                case 'audio':
+                    $mediaId   = $message['audio']['id'] ?? null;
+                    $mediaType = 'audio';
+                    $mediaMime = $message['audio']['mime_type'] ?? 'audio/ogg';
+                    break;
+                case 'voice':
+                    $mediaId   = $message['voice']['id'] ?? null;
+                    $mediaType = 'audio';
+                    $mediaMime = $message['voice']['mime_type'] ?? 'audio/ogg';
+                    break;
+                default:
+                    // Unknown types (sticker, location, contacts) — log and skip parsing
+                    break;
+            }
 
             $phoneWithPlus = '+' . $phone;
 
@@ -73,6 +117,25 @@ class ProcessInboundWhatsApp implements ShouldQueue
                 return;
             }
 
+            // ── If a media file came in, download it and create a WaMedia record ──
+            $waMedia = null;
+            if ($mediaId && $mediaType) {
+                $localPath = $wa->downloadMedia($mediaId, $mediaMime);
+                if ($localPath) {
+                    $waMedia = \App\Domain\WhatsApp\Models\WaMedia::create([
+                        'meta_media_id' => $mediaId,
+                        'user_id'       => $user->id,
+                        'type'          => $mediaType,
+                        'mime_type'     => $mediaMime,
+                        'filename'      => $mediaFilename,
+                        'file_path'     => $localPath,
+                        'caption'       => $text,
+                        'task_id'       => null,
+                        'expires_at'    => now()->addHours(2),
+                    ]);
+                }
+            }
+
             // Parse command - handle multi-word commands FIRST
             $text = trim($text);
             $textUpper = strtoupper($text);
@@ -101,6 +164,8 @@ class ProcessInboundWhatsApp implements ShouldQueue
                     'CHAT', 'DM', 'REPLY',
                     // Phase 3 — chat session close
                     'CLOSE', 'END', 'BYE', 'EXIT',
+                    // Phase 4 — team overview + batched assign markers
+                    'ALL', 'DONE', 'FINISH', 'SEND', 'ABORT',
                 ];
                 $firstWord = strtoupper(explode(' ', $text)[0] ?? '');
                 if (in_array($firstWord, $singleWordCommands)) {
@@ -120,7 +185,7 @@ class ProcessInboundWhatsApp implements ShouldQueue
                 $phoneWithPlus
             );
 
-            $reply = $handler->handle($user, $command, $text, $messageId);
+            $reply = $handler->handle($user, $command, $text, $messageId, $waMedia);
 
             // Empty/null reply means "no echo back to sender" (e.g. chat-mode silent forward)
             if ($reply !== '' && $reply !== null) {

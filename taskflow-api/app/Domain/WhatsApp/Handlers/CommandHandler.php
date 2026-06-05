@@ -5,6 +5,7 @@ namespace App\Domain\WhatsApp\Handlers;
 use App\Domain\Task\Models\Task;
 use App\Domain\Task\Models\TaskUpdate;
 use App\Domain\User\Models\User;
+use App\Domain\WhatsApp\Models\WaMedia;
 use App\Domain\WhatsApp\Services\WhatsAppService;
 use App\Domain\Logs\Models\ActivityLog;
 use App\Jobs\RecalculateApixScore;
@@ -14,15 +15,13 @@ class CommandHandler
 {
     public function __construct(private WhatsAppService $wa) {}
 
-    public function handle(User $user, string $command, string $fullMessage, ?string $waMessageId = null): string
+    public function handle(User $user, string $command, string $fullMessage, ?string $waMessageId = null, ?WaMedia $waMedia = null): string
     {
         $user->update(['last_seen_at' => now()]);
         $textTrimmed = trim($fullMessage);
 
         // ──────────────────────────────────────────────────────────────
         // PHASE 3 — CHAT SESSION MODE
-        // If user is in active chat with someone, forward ALL messages
-        // (except CLOSE/END/BYE/EXIT) to the peer. Commands do NOT execute.
         // ──────────────────────────────────────────────────────────────
         $stateNow = $user->wa_session_state;
         if (is_array($stateNow) && !empty($stateNow['in_chat_with_id'])) {
@@ -30,7 +29,27 @@ class CommandHandler
             if (in_array($upperFirst, ['CLOSE', 'END', 'BYE', 'EXIT'], true)) {
                 return $this->closeChatSession($user, false);
             }
+            // If media came in chat mode, forward as media instead of text
+            if ($waMedia) {
+                return $this->forwardChatMedia($user, $waMedia, $textTrimmed);
+            }
             return $this->forwardChatMessage($user, $textTrimmed);
+        }
+
+        // ──────────────────────────────────────────────────────────────
+        // PHASE 4 — BATCHED TASK BUILDING MODE
+        // After "ASSIGN <name>" (without description), user collects
+        // multiple text/media messages. "DONE" finalizes, "CANCEL" aborts.
+        // ──────────────────────────────────────────────────────────────
+        if (is_array($stateNow) && ($stateNow['awaiting'] ?? null) === 'task_batch') {
+            $upperFirst = strtoupper(explode(' ', $textTrimmed)[0] ?? '');
+            if (in_array($upperFirst, ['DONE', 'FINISH', 'SEND'], true)) {
+                return $this->finalizeBatchedTask($user);
+            }
+            if (in_array($upperFirst, ['CANCEL', 'ABORT'], true)) {
+                return $this->cancelBatchedTask($user);
+            }
+            return $this->appendToBatch($user, $textTrimmed, $waMedia);
         }
 
         // ── If user replies with JUST a number, treat as task selection from previous list ──
@@ -44,7 +63,7 @@ class CommandHandler
         $cmd = strtoupper(trim($command));
 
         if ($user->isManager()) {
-            $managerResult = $this->tryManagerCommand($user, $cmd, $fullMessage);
+            $managerResult = $this->tryManagerCommand($user, $cmd, $fullMessage, $waMedia);
             if ($managerResult !== null) return $managerResult;
         }
 
@@ -80,11 +99,12 @@ class CommandHandler
         };
     }
 
-    private function tryManagerCommand(User $manager, string $cmd, string $fullMessage): ?string
+    private function tryManagerCommand(User $manager, string $cmd, string $fullMessage, ?WaMedia $waMedia = null): ?string
     {
-        if ($cmd === 'ASSIGN') return $this->handleAssign($manager, $fullMessage);
+        if ($cmd === 'ASSIGN') return $this->handleAssign($manager, $fullMessage, $waMedia);
         if ($cmd === 'ADD EMPLOYEE') return $this->handleAddEmployee($manager, $fullMessage);
         if ($cmd === 'LIST' || $cmd === 'LIST EMPLOYEES') return $this->handleListEmployees($manager);
+        if ($cmd === 'ALL') return $this->handleAll($manager);
         if ($cmd === 'TEAM') return $this->handleTeamTree($manager);
         if ($cmd === 'REPORT TODAY' || $cmd === 'REPORT WEEK' || $cmd === 'REPORT') return $this->handleReport($manager, $cmd);
         if ($cmd === 'VERIFY') return $this->handleVerify($manager, $fullMessage);
@@ -98,15 +118,15 @@ class CommandHandler
         return null;
     }
 
-    private function handleAssign(User $manager, string $message): string
+    private function handleAssign(User $manager, string $message, ?WaMedia $waMedia = null): string
     {
         $parts = preg_split('/\s+/', trim($message), 3);
-        if (count($parts) < 3) {
-            return "❌ *Invalid format*\n\nUse:\n*ASSIGN <name> <task description>*\n\nExample:\nASSIGN Priya Visit Dr. Patel today by 5PM";
+        if (count($parts) < 2) {
+            return "❌ *Invalid format*\n\nUse:\n*ASSIGN <name> <task description>*\n— or —\n*ASSIGN <name>* (alone) to build a multi-message task\n\nExample:\nASSIGN Priya Visit Dr. Patel today by 5PM";
         }
 
         $employeeName = $parts[1];
-        $taskTitle    = $parts[2];
+        $taskTitle    = $parts[2] ?? null;
 
         ActivityLog::record(
             'task', 'assign_attempt', 'info',
@@ -127,7 +147,6 @@ class CommandHandler
             return "❌ *Employee \"{$employeeName}\" not found*\n\nReply *LIST* to see your team.";
         }
 
-        // Filter to only those manager can assign to (hierarchy check)
         $assignable = $candidates->filter(fn($c) => $manager->canAssignTo($c))->values();
 
         if ($assignable->isEmpty()) {
@@ -136,10 +155,10 @@ class CommandHandler
                 "🚫 Hierarchy block: {$manager->name} can't assign to {$candidates->first()->name} (not in sub-tree)",
                 ['manager_id' => $manager->id]
             );
-            return "🚫 *Not allowed*\n\n\"{$candidates->first()->name}\" is not in your team.\n\nYou can only assign tasks to people who report to you (directly or indirectly).\n\nReply *TEAM* to see your team tree.";
+            return "🚫 *Not allowed*\n\n\"{$candidates->first()->name}\" is not in your team.\n\nReply *TEAM* to see your team tree.";
         }
 
-        // Phase 2: Ambiguity — multiple matches → ask user to pick
+        // Ambiguity — multiple matches → ask user to pick
         if ($assignable->count() > 1) {
             $msg = "🤔 *{$assignable->count()}* matches for *{$employeeName}*:\n\n";
             $candidateIds = [];
@@ -160,15 +179,22 @@ class CommandHandler
             return $msg;
         }
 
-        // Single match — proceed
-        return $this->createAndNotifyTask($manager, $assignable->first(), $taskTitle);
+        $employee = $assignable->first();
+
+        // Phase 4: If only "ASSIGN <name>" (no task description), START BATCH MODE
+        if (!$taskTitle) {
+            return $this->startBatchTask($manager, $employee, $waMedia);
+        }
+
+        // Otherwise — immediate single-message task (with optional attached media)
+        return $this->createAndNotifyTask($manager, $employee, $taskTitle, $waMedia);
     }
 
     /**
      * Shared helper: create a Task, notify the employee via WhatsApp, return manager-facing reply.
-     * Honestly reports delivery success/failure based on sendTaskAssignment return value.
+     * If a WaMedia is attached, also forward the file to the assignee.
      */
-    private function createAndNotifyTask(User $manager, User $employee, string $taskTitle): string
+    private function createAndNotifyTask(User $manager, User $employee, string $taskTitle, ?WaMedia $waMedia = null): string
     {
         $dueDate = $this->parseDueDate($taskTitle);
 
@@ -193,14 +219,32 @@ class CommandHandler
         $task->load(['assignedTo', 'assignedBy']);
         $delivered = $this->wa->sendTaskAssignment($task);
 
+        // ── If a media file was attached to the ASSIGN message, forward it now ──
+        $mediaDelivered = null;
+        if ($waMedia && $delivered) {
+            $waMedia->update(['task_id' => $task->id]);
+            $caption = "📎 Attachment for: " . substr($taskTitle, 0, 80);
+            $mediaDelivered = $this->wa->sendMedia(
+                $employee->phone,
+                $waMedia->file_path,
+                $waMedia->mime_type ?? 'application/octet-stream',
+                $caption,
+                $waMedia->filename
+            );
+        }
+
         $dueStr = $dueDate ? $dueDate->format('d M, h:i A') : 'No deadline';
         $deliveryNote = $delivered
             ? "✅ Employee notified via WhatsApp."
             : "⚠️ *WhatsApp notification failed.*\nTask saved but employee didn't receive message.\nCheck Logs tab for reason (likely 24-hr window or unverified number).";
 
+        if ($waMedia) {
+            $deliveryNote .= "\n" . ($mediaDelivered ? "📎 Attachment forwarded." : "⚠️ Attachment forward failed — check Logs.");
+        }
+
         return "✅ *Task Assigned!*\n\n"
              . "👤 Employee: {$employee->name}\n"
-             . "📋 Task: {$taskTitle}\n"
+             . "📋 Task: " . substr($taskTitle, 0, 200) . (strlen($taskTitle) > 200 ? '…' : '') . "\n"
              . "🆔 Task ID: T-" . substr($task->id, 0, 6) . "\n"
              . "📅 Due: {$dueStr}\n\n"
              . $deliveryNote;
@@ -287,6 +331,7 @@ class CommandHandler
     {
         $msg = "🌳 *Your Team Tree*\n\n";
         $msg .= $this->renderTreeNode($manager, 0);
+        $msg .= "\n_Reply *ALL* for flat list with task counts._";
         return trim($msg);
     }
 
@@ -296,9 +341,20 @@ class CommandHandler
         $arrow = $depth > 0 ? '└─ ' : '';
         $role = $user->isAdmin() ? '👑' : ($user->isManager() ? '👔' : '👤');
 
+        // Counts at this level
+        $active = Task::where('assigned_to', $user->id)
+            ->whereIn('status', ['assigned', 'accepted', 'in_progress', 'waiting'])
+            ->count();
+        $overdue = Task::where('assigned_to', $user->id)
+            ->where('due_date', '<', now())
+            ->whereNotIn('status', ['completed', 'verified', 'cancelled'])
+            ->count();
+
         $line = "{$indent}{$arrow}{$role} *{$user->name}*";
         if ($user->designation) $line .= " ({$user->designation})";
-        $line .= "\n";
+        $countStr = " — 📋{$active}";
+        if ($overdue > 0) $countStr .= " ⏰{$overdue}";
+        $line .= $countStr . "\n";
 
         $reports = $user->directReports()->where('is_active', true)->orderBy('name')->get();
         foreach ($reports as $report) {
@@ -396,27 +452,81 @@ class CommandHandler
         $parts = preg_split('/\s+/', trim($message), 2);
         $name = $parts[1] ?? '';
 
-        $employee = User::where('is_active', true)
+        $candidates = User::where('is_active', true)
             ->whereRaw('LOWER(name) LIKE ?', ['%' . strtolower($name) . '%'])
-            ->first();
+            ->orderBy('name')
+            ->get();
 
-        if (!$employee) return "❌ Employee \"{$name}\" not found.";
+        if ($candidates->isEmpty()) return "❌ Employee \"{$name}\" not found.";
 
+        if ($candidates->count() > 1) {
+            $msg = "🤔 Multiple matches for *{$name}*:\n\n";
+            foreach ($candidates as $i => $c) {
+                $msg .= "*" . ($i + 1) . ".* {$c->name}";
+                if ($c->designation) $msg .= " — {$c->designation}";
+                $msg .= "\n";
+            }
+            $msg .= "\nUse full name.";
+            return $msg;
+        }
+
+        $employee = $candidates->first();
+
+        // Compute counts
         $activeTasks = Task::where('assigned_to', $employee->id)
-            ->whereNotIn('status', ['completed', 'verified'])->get();
+            ->whereNotIn('status', ['completed', 'verified', 'cancelled', 'rejected'])
+            ->orderByRaw("CASE status WHEN 'in_progress' THEN 1 WHEN 'accepted' THEN 2 WHEN 'waiting' THEN 3 WHEN 'assigned' THEN 4 ELSE 5 END")
+            ->orderBy('due_date')
+            ->get();
+
         $todayDone = Task::where('assigned_to', $employee->id)
             ->whereIn('status', ['completed', 'verified'])
             ->whereDate('completed_at', today())->count();
 
-        $msg = "📊 *{$employee->name}*\n\n"
-             . "📱 {$employee->phone}\n"
-             . "📋 Active Tasks: {$activeTasks->count()}\n"
-             . "✅ Completed Today: {$todayDone}\n";
+        $overdueCount = $activeTasks->filter(fn($t) => $t->due_date && $t->due_date->isPast())->count();
 
-        if ($activeTasks->count() > 0) {
-            $msg .= "\n*Active Tasks:*\n";
-            foreach ($activeTasks->take(5) as $t) {
-                $msg .= "• " . $t->title . " ({$t->status})\n";
+        // Currently working on (in_progress)
+        $current = $activeTasks->first(fn($t) => $t->status === 'in_progress');
+
+        $msg = "📊 *{$employee->name}*\n";
+        if ($employee->designation) $msg .= "_{$employee->designation}_\n";
+        $msg .= "📱 {$employee->phone}\n\n";
+
+        if ($current) {
+            $msg .= "▶️ *Currently working on:*\n";
+            $msg .= "   📋 " . $current->title . "\n";
+            $msg .= "   🆔 T-" . substr($current->id, 0, 6) . "\n";
+            if ($current->due_date) {
+                $diff = $current->due_date->diffForHumans(null, true);
+                $msg .= "   📅 Due: " . $current->due_date->format('d M, h:i A')
+                     . ($current->due_date->isPast() ? " (⏰ {$diff} late)" : " ({$diff} left)")
+                     . "\n";
+            }
+            $msg .= "\n";
+        }
+
+        $msg .= "📋 Active: *{$activeTasks->count()}*";
+        if ($overdueCount > 0) $msg .= "  •  ⏰ Overdue: *{$overdueCount}*";
+        $msg .= "\n";
+        $msg .= "✅ Completed today: *{$todayDone}*\n";
+
+        if ($activeTasks->isNotEmpty()) {
+            $msg .= "\n*All active tasks (with delay):*\n";
+            foreach ($activeTasks->take(10) as $i => $t) {
+                $num = $i + 1;
+                $msg .= "{$num}. " . $t->title . "\n";
+                $msg .= "   _Status: {$t->status}_";
+                if ($t->due_date) {
+                    if ($t->due_date->isPast()) {
+                        $msg .= "  •  ⏰ *" . $t->due_date->diffForHumans(null, true) . " late*";
+                    } else {
+                        $msg .= "  •  ⏳ " . $t->due_date->diffForHumans(null, true) . " left";
+                    }
+                }
+                $msg .= "\n";
+            }
+            if ($activeTasks->count() > 10) {
+                $msg .= "_…and " . ($activeTasks->count() - 10) . " more_\n";
             }
         }
         return $msg;
@@ -935,6 +1045,298 @@ class CommandHandler
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // PHASE 4 — BATCHED ASSIGN (multi-message task with attachments)
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * Start a batched task — admin sends "ASSIGN <name>" alone, then follows up
+     * with multiple text messages and media files. "DONE" finalizes.
+     */
+    private function startBatchTask(User $manager, User $employee, ?WaMedia $waMedia): string
+    {
+        $now = now()->toIso8601String();
+
+        $mediaIds = [];
+        $textLines = [];
+
+        if ($waMedia) {
+            $mediaIds[] = $waMedia->id;
+        }
+
+        $this->setSessionAwaiting($manager, 'task_batch', [
+            'task_for_user_id'   => $employee->id,
+            'task_for_user_name' => $employee->name,
+            'buffered_text'      => $textLines,
+            'buffered_media'     => $mediaIds,
+            'started_at'         => $now,
+        ], 60); // 60 min expiry
+
+        $intro = "📦 *Building task for {$employee->name}*\n\n"
+               . "Ab text, images, PDF, Excel, Word, PPT — kuch bhi bhej do, sab is task me jud jayega.\n\n"
+               . "Type *DONE* to finalize and send.\n"
+               . "Type *CANCEL* to abort.\n";
+        if ($waMedia) {
+            $intro .= "\n📎 1 attachment already added.";
+        }
+        return $intro;
+    }
+
+    /**
+     * Append text and/or media to the in-progress batch.
+     */
+    private function appendToBatch(User $user, string $text, ?WaMedia $waMedia): string
+    {
+        $state = is_array($user->wa_session_state) ? $user->wa_session_state : [];
+        $textLines = $state['buffered_text'] ?? [];
+        $mediaIds  = $state['buffered_media'] ?? [];
+
+        $added = [];
+        if ($text !== '') {
+            $textLines[] = $text;
+            $added[] = "text";
+        }
+        if ($waMedia) {
+            $mediaIds[] = $waMedia->id;
+            $added[] = $waMedia->type;
+        }
+
+        if (empty($added)) {
+            return "📦 *Batch open*\n\nKuch nahi mila add karne ke liye. Type *DONE* to finalize.";
+        }
+
+        $state['buffered_text']  = $textLines;
+        $state['buffered_media'] = $mediaIds;
+        $user->wa_session_state  = $state;
+        $user->save();
+
+        $textCount = count($textLines);
+        $mediaCount = count($mediaIds);
+        $forName = $state['task_for_user_name'] ?? '?';
+
+        return "✓ Added " . implode(' + ', $added) . " to task for *{$forName}*\n"
+             . "📝 {$textCount} text · 📎 {$mediaCount} files\n\n"
+             . "Type *DONE* to send, *CANCEL* to abort.";
+    }
+
+    /**
+     * Finalize the batched task: create Task, forward all collected items to assignee.
+     */
+    private function finalizeBatchedTask(User $manager): string
+    {
+        $state = is_array($manager->wa_session_state) ? $manager->wa_session_state : [];
+        $employeeId = $state['task_for_user_id'] ?? null;
+        $textLines = $state['buffered_text'] ?? [];
+        $mediaIds  = $state['buffered_media'] ?? [];
+
+        // Clear batch state regardless of outcome
+        foreach (['awaiting', 'task_for_user_id', 'task_for_user_name', 'buffered_text', 'buffered_media', 'started_at', 'expires_at'] as $k) {
+            unset($state[$k]);
+        }
+        $manager->wa_session_state = empty($state) ? null : $state;
+        $manager->save();
+
+        if (!$employeeId) {
+            return "❌ Batch state lost. Try again with *ASSIGN <name>*.";
+        }
+        if (empty($textLines) && empty($mediaIds)) {
+            return "❌ Batch khaali hai. *ASSIGN <name>* karke phir se shuru karo.";
+        }
+
+        $employee = User::find($employeeId);
+        if (!$employee || !$employee->is_active) {
+            return "❌ Employee ab available nahi hai. Batch discard.";
+        }
+
+        if (!$manager->canAssignTo($employee)) {
+            return "🚫 Aap *{$employee->name}* ko ab assign nahi kar sakte.";
+        }
+
+        // Build title — first non-empty text, or fallback
+        $title = '';
+        foreach ($textLines as $line) {
+            if (trim($line) !== '') {
+                $title = $line;
+                break;
+            }
+        }
+        if ($title === '') {
+            $title = count($mediaIds) > 0 ? "Task with " . count($mediaIds) . " attachments" : "Multi-message task";
+        }
+        // Truncate to fit title column (varchar 500)
+        if (strlen($title) > 480) $title = substr($title, 0, 477) . '...';
+
+        // Create task
+        $dueDate = $this->parseDueDate($title);
+        $task = Task::create([
+            'tenant_id'     => 'default',
+            'title'         => $title,
+            'assigned_by'   => $manager->id,
+            'assigned_to'   => $employee->id,
+            'status'        => 'assigned',
+            'priority'      => 'medium',
+            'due_date'      => $dueDate,
+            'reward_points' => 50,
+        ]);
+
+        ActivityLog::record(
+            'task', 'assign_batch', 'success',
+            "📦 Batched task assigned to {$employee->name}: \"{$title}\"",
+            ['task_id' => $task->id, 'text_count' => count($textLines), 'media_count' => count($mediaIds)]
+        );
+
+        // Notify assignee
+        $task->load(['assignedTo', 'assignedBy']);
+        $notified = $this->wa->sendTaskAssignment($task);
+
+        // Forward all buffered text lines (except the title's source line — to avoid duplicating)
+        $textsForwarded = 0;
+        foreach ($textLines as $line) {
+            if (trim($line) === '') continue;
+            $msg = "📋 *Task T-" . substr($task->id, 0, 6) . " — additional info:*\n\n" . $line;
+            if ($this->wa->sendMessage($employee->phone, $msg)) {
+                $textsForwarded++;
+            }
+        }
+
+        // Forward all buffered media
+        $mediaForwarded = 0;
+        $mediaFailed = 0;
+        foreach ($mediaIds as $mediaId) {
+            $waMedia = WaMedia::find($mediaId);
+            if (!$waMedia || !is_readable($waMedia->file_path)) {
+                $mediaFailed++;
+                continue;
+            }
+            $waMedia->update(['task_id' => $task->id]);
+            $caption = "📎 For task T-" . substr($task->id, 0, 6);
+            $ok = $this->wa->sendMedia(
+                $employee->phone,
+                $waMedia->file_path,
+                $waMedia->mime_type ?? 'application/octet-stream',
+                $caption,
+                $waMedia->filename
+            );
+            if ($ok) $mediaForwarded++;
+            else $mediaFailed++;
+        }
+
+        return "✅ *Batched Task Assigned!*\n\n"
+             . "👤 To: {$employee->name}\n"
+             . "🆔 T-" . substr($task->id, 0, 6) . "\n"
+             . "📋 " . substr($title, 0, 100) . (strlen($title) > 100 ? '…' : '') . "\n\n"
+             . ($notified ? "✅ Notification delivered.\n" : "⚠️ Notification failed.\n")
+             . "📝 Text forwarded: {$textsForwarded}\n"
+             . "📎 Media forwarded: {$mediaForwarded}"
+             . ($mediaFailed > 0 ? " (⚠️ {$mediaFailed} failed)" : "");
+    }
+
+    /**
+     * Cancel an in-progress batch.
+     */
+    private function cancelBatchedTask(User $manager): string
+    {
+        $state = is_array($manager->wa_session_state) ? $manager->wa_session_state : [];
+        $forName = $state['task_for_user_name'] ?? null;
+
+        foreach (['awaiting', 'task_for_user_id', 'task_for_user_name', 'buffered_text', 'buffered_media', 'started_at', 'expires_at'] as $k) {
+            unset($state[$k]);
+        }
+        $manager->wa_session_state = empty($state) ? null : $state;
+        $manager->save();
+
+        return "🚫 *Batch cancelled*" . ($forName ? " (was building for {$forName})" : "") . "\n\nNormal commands ab kaam karenge.";
+    }
+
+    /**
+     * Forward an attached media file in chat-mode to the peer.
+     */
+    private function forwardChatMedia(User $user, WaMedia $waMedia, string $caption): string
+    {
+        $state = is_array($user->wa_session_state) ? $user->wa_session_state : [];
+        $peerId = $state['in_chat_with_id'] ?? null;
+        if (!$peerId) return "";
+
+        $peer = User::find($peerId);
+        if (!$peer || !$peer->phone || !$peer->is_active) {
+            foreach (['in_chat_with_id', 'in_chat_with_name', 'in_chat_started_at'] as $k) {
+                unset($state[$k]);
+            }
+            $user->wa_session_state = empty($state) ? null : $state;
+            $user->save();
+            return "❌ Peer ab available nahi hai. Chat auto-closed.";
+        }
+
+        if (!is_readable($waMedia->file_path)) {
+            return "⚠️ File expire ho gayi server pe.";
+        }
+
+        $captionForPeer = "💬 *{$user->name}:* " . ($caption ?: '(file)');
+        $ok = $this->wa->sendMedia(
+            $peer->phone,
+            $waMedia->file_path,
+            $waMedia->mime_type ?? 'application/octet-stream',
+            $captionForPeer,
+            $waMedia->filename
+        );
+
+        if (!$ok) {
+            return "⚠️ *{$peer->name}* ko file deliver nahi hui.";
+        }
+        return ""; // silent
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // PHASE 4 — ALL command (team overview with counts)
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * ALL — list all employees in the manager's reachable tree with task counts.
+     */
+    private function handleAll(User $manager): string
+    {
+        $employees = User::where('is_active', true)
+            ->where('id', '!=', $manager->id)
+            ->orderBy('name')
+            ->get();
+
+        $manageable = $employees->filter(fn($e) => $manager->canAssignTo($e))->values();
+
+        if ($manageable->isEmpty()) {
+            return "❌ Aapke team me koi assignable employee nahi hai.\n\nReply *TEAM* to see hierarchy.";
+        }
+
+        $msg = "👥 *Team Overview — {$manageable->count()} people*\n\n";
+
+        foreach ($manageable as $i => $emp) {
+            $active = Task::where('assigned_to', $emp->id)
+                ->whereIn('status', ['assigned', 'accepted', 'in_progress', 'waiting'])
+                ->count();
+            $overdue = Task::where('assigned_to', $emp->id)
+                ->where('due_date', '<', now())
+                ->whereNotIn('status', ['completed', 'verified', 'cancelled'])
+                ->count();
+            $completedToday = Task::where('assigned_to', $emp->id)
+                ->whereIn('status', ['completed', 'verified'])
+                ->whereDate('completed_at', today())
+                ->count();
+            $reports = User::where('reports_to', $emp->id)->where('is_active', true)->count();
+
+            $num = $i + 1;
+            $msg .= "*{$num}. {$emp->name}*";
+            if ($emp->designation) $msg .= " — _{$emp->designation}_";
+            $msg .= "\n";
+            $msg .= "   📋 Active: {$active}";
+            if ($overdue > 0) $msg .= "  •  ⏰ Overdue: *{$overdue}*";
+            $msg .= "\n";
+            $msg .= "   ✅ Today: {$completedToday}";
+            if ($reports > 0) $msg .= "  •  👥 Manages: {$reports}";
+            $msg .= "\n\n";
+        }
+
+        return trim($msg);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // PHASE 3 — CONVERSATIONAL CHAT SESSION (CHAT <name> → CLOSE)
     // ════════════════════════════════════════════════════════════════════
 
@@ -1170,11 +1572,14 @@ class CommandHandler
     {
         if ($user->isManager()) {
             return "📋 *Manager Commands*\n\n"
-                 . "*ASSIGN <name> <task>* — Assign task\n"
+                 . "*ASSIGN <name> <task>* — Quick task\n"
+                 . "*ASSIGN <name>* — Multi-message task (DONE to finalize)\n"
+                 . "  💡 Files (image/PDF/Excel/Word/PPT) bhej, *DONE* type karke send\n"
                  . "*ADD EMPLOYEE <name> <phone> <role>* — Add employee\n"
-                 . "*LIST* — Show team\n"
-                 . "*TEAM* — Show team tree\n"
-                 . "*STATUS <name>* — Employee status\n"
+                 . "*LIST* — Show team (basic)\n"
+                 . "*ALL* — Show team with task counts\n"
+                 . "*TEAM* — Show team tree with counts\n"
+                 . "*STATUS <name>* — Detailed employee status with delays\n"
                  . "*CANCEL T-xxx [reason]* — Cancel a task\n"
                  . "*REASSIGN T-xxx <name>* — Move task to someone else\n"
                  . "*REOPEN T-xxx [reason]* — Reopen completed/verified task\n"

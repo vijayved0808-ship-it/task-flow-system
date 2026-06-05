@@ -29,5 +29,10 @@ return Application::configure(basePath: dirname(__DIR__))
         $schedule->command('tasks:auto-verify')
             ->everyTenMinutes()
             ->withoutOverlapping();
+
+        // Cleanup expired WhatsApp media files every 30 min (2-hour TTL)
+        $schedule->command('media:cleanup')
+            ->everyThirtyMinutes()
+            ->withoutOverlapping();
     })
     ->withExceptions(function (Exceptions $exceptions) {})->create();
