@@ -43,12 +43,48 @@ class CommandHandler
         // ──────────────────────────────────────────────────────────────
         if (is_array($stateNow) && ($stateNow['awaiting'] ?? null) === 'task_batch') {
             $upperFirst = strtoupper(explode(' ', $textTrimmed)[0] ?? '');
+
+            // Explicit finalize / abort markers
             if (in_array($upperFirst, ['DONE', 'FINISH', 'SEND'], true)) {
                 return $this->finalizeBatchedTask($user);
             }
             if (in_array($upperFirst, ['CANCEL', 'ABORT'], true)) {
                 return $this->cancelBatchedTask($user);
             }
+
+            // ── VALIDATION 1: Auto-finalize after 2 min of idle ──
+            $lastActivity = $stateNow['last_activity_at'] ?? $stateNow['started_at'] ?? null;
+            if ($lastActivity) {
+                try {
+                    $idleMinutes = \Carbon\Carbon::parse($lastActivity)->diffInMinutes(now());
+                    if ($idleMinutes >= 2) {
+                        $autoReply = $this->finalizeBatchedTask($user);
+                        // After finalize, state is cleared. Re-process current message normally.
+                        $followup = $this->handle($user, $command, $fullMessage, $waMessageId, $waMedia);
+                        return "⏰ *Auto-finalized — batch was idle for {$idleMinutes} min.*\n\n"
+                             . $autoReply
+                             . "\n\n———\n\n" . $followup;
+                    }
+                } catch (\Exception $e) {
+                    // Bad timestamp — ignore, continue normally
+                }
+            }
+
+            // ── VALIDATION 2: If user uses another command, auto-finalize first ──
+            // Only triggers on pure command messages (no media attached). Media in batch = content.
+            $cmdUpper = strtoupper(trim($command));
+            $isCommand = !empty($cmdUpper)
+                && !in_array($cmdUpper, ['DONE', 'FINISH', 'SEND', 'CANCEL', 'ABORT'], true)
+                && !$waMedia;
+            if ($isCommand) {
+                $autoReply = $this->finalizeBatchedTask($user);
+                $followup = $this->handle($user, $command, $fullMessage, $waMessageId, $waMedia);
+                return "⏱ *Auto-finalized — you started a new command.*\n\n"
+                     . $autoReply
+                     . "\n\n———\n\n" . $followup;
+            }
+
+            // Normal append (text or media) — and bump activity timestamp
             return $this->appendToBatch($user, $textTrimmed, $waMedia);
         }
 
@@ -122,11 +158,11 @@ class CommandHandler
     {
         $parts = preg_split('/\s+/', trim($message), 3);
         if (count($parts) < 2) {
-            return "❌ *Invalid format*\n\nUse:\n*ASSIGN <name> <task description>*\n— or —\n*ASSIGN <name>* (alone) to build a multi-message task\n\nExample:\nASSIGN Priya Visit Dr. Patel today by 5PM";
+            return "❌ *Invalid format*\n\nUse: *ASSIGN <name> [optional task text]*\n\nExample:\nASSIGN Parag fix the homepage\n\nFiles/images/PDFs jo bhi bhejo, sab is task me jud jayenge. Last me *DONE* bhejke send karo.";
         }
 
         $employeeName = $parts[1];
-        $taskTitle    = $parts[2] ?? null;
+        $initialText  = $parts[2] ?? null;  // optional first-line task text
 
         ActivityLog::record(
             'task', 'assign_attempt', 'info',
@@ -181,13 +217,10 @@ class CommandHandler
 
         $employee = $assignable->first();
 
-        // Phase 4: If only "ASSIGN <name>" (no task description), START BATCH MODE
-        if (!$taskTitle) {
-            return $this->startBatchTask($manager, $employee, $waMedia);
-        }
-
-        // Otherwise — immediate single-message task (with optional attached media)
-        return $this->createAndNotifyTask($manager, $employee, $taskTitle, $waMedia);
+        // PHASE 4 (revised): ASSIGN ALWAYS enters batch mode.
+        // Initial text (if provided) becomes the first batch item.
+        // User explicitly finalizes with DONE.
+        return $this->startBatchTask($manager, $employee, $waMedia, $initialText);
     }
 
     /**
@@ -1049,16 +1082,22 @@ class CommandHandler
     // ════════════════════════════════════════════════════════════════════
 
     /**
-     * Start a batched task — admin sends "ASSIGN <name>" alone, then follows up
-     * with multiple text messages and media files. "DONE" finalizes.
+     * Start a batched task. Now invoked from BOTH:
+     * - "ASSIGN Parag" alone (no initial text)
+     * - "ASSIGN Parag Long data" (initialText = "Long data" becomes first batch entry)
+     * - "ASSIGN Parag\nLong data" — same thing, newlines are whitespace
+     * - ASSIGN with attached media file (waMedia is the first batch item)
      */
-    private function startBatchTask(User $manager, User $employee, ?WaMedia $waMedia): string
+    private function startBatchTask(User $manager, User $employee, ?WaMedia $waMedia, ?string $initialText = null): string
     {
         $now = now()->toIso8601String();
 
-        $mediaIds = [];
         $textLines = [];
+        if ($initialText !== null && trim($initialText) !== '') {
+            $textLines[] = trim($initialText);
+        }
 
+        $mediaIds = [];
         if ($waMedia) {
             $mediaIds[] = $waMedia->id;
         }
@@ -1069,20 +1108,29 @@ class CommandHandler
             'buffered_text'      => $textLines,
             'buffered_media'     => $mediaIds,
             'started_at'         => $now,
-        ], 60); // 60 min expiry
+            'last_activity_at'   => $now,
+        ], 60); // 60 min hard expiry (selection slot)
 
         $intro = "📦 *Building task for {$employee->name}*\n\n"
                . "Ab text, images, PDF, Excel, Word, PPT — kuch bhi bhej do, sab is task me jud jayega.\n\n"
                . "Type *DONE* to finalize and send.\n"
-               . "Type *CANCEL* to abort.\n";
-        if ($waMedia) {
-            $intro .= "\n📎 1 attachment already added.";
+               . "Type *CANCEL* to abort.\n"
+               . "_⏰ Auto-sends after 2 min idle._\n";
+
+        $hasContent = !empty($textLines) || $waMedia;
+        if ($hasContent) {
+            $bits = [];
+            if (!empty($textLines)) $bits[] = count($textLines) . " text";
+            if ($waMedia)           $bits[] = "1 " . $waMedia->type;
+            $intro .= "\n✓ Already added: " . implode(' + ', $bits);
         }
+
         return $intro;
     }
 
     /**
      * Append text and/or media to the in-progress batch.
+     * Updates last_activity_at so the 2-min idle check resets.
      */
     private function appendToBatch(User $user, string $text, ?WaMedia $waMedia): string
     {
@@ -1104,9 +1152,10 @@ class CommandHandler
             return "📦 *Batch open*\n\nKuch nahi mila add karne ke liye. Type *DONE* to finalize.";
         }
 
-        $state['buffered_text']  = $textLines;
-        $state['buffered_media'] = $mediaIds;
-        $user->wa_session_state  = $state;
+        $state['buffered_text']    = $textLines;
+        $state['buffered_media']   = $mediaIds;
+        $state['last_activity_at'] = now()->toIso8601String();  // reset 2-min idle timer
+        $user->wa_session_state    = $state;
         $user->save();
 
         $textCount = count($textLines);
@@ -1115,7 +1164,8 @@ class CommandHandler
 
         return "✓ Added " . implode(' + ', $added) . " to task for *{$forName}*\n"
              . "📝 {$textCount} text · 📎 {$mediaCount} files\n\n"
-             . "Type *DONE* to send, *CANCEL* to abort.";
+             . "Type *DONE* to send, *CANCEL* to abort.\n"
+             . "_⏰ Auto-send after 2 min idle._";
     }
 
     /**
@@ -1129,7 +1179,7 @@ class CommandHandler
         $mediaIds  = $state['buffered_media'] ?? [];
 
         // Clear batch state regardless of outcome
-        foreach (['awaiting', 'task_for_user_id', 'task_for_user_name', 'buffered_text', 'buffered_media', 'started_at', 'expires_at'] as $k) {
+        foreach (['awaiting', 'task_for_user_id', 'task_for_user_name', 'buffered_text', 'buffered_media', 'started_at', 'last_activity_at', 'expires_at'] as $k) {
             unset($state[$k]);
         }
         $manager->wa_session_state = empty($state) ? null : $state;
@@ -1238,7 +1288,7 @@ class CommandHandler
         $state = is_array($manager->wa_session_state) ? $manager->wa_session_state : [];
         $forName = $state['task_for_user_name'] ?? null;
 
-        foreach (['awaiting', 'task_for_user_id', 'task_for_user_name', 'buffered_text', 'buffered_media', 'started_at', 'expires_at'] as $k) {
+        foreach (['awaiting', 'task_for_user_id', 'task_for_user_name', 'buffered_text', 'buffered_media', 'started_at', 'last_activity_at', 'expires_at'] as $k) {
             unset($state[$k]);
         }
         $manager->wa_session_state = empty($state) ? null : $state;
@@ -1572,26 +1622,23 @@ class CommandHandler
     {
         if ($user->isManager()) {
             return "📋 *Manager Commands*\n\n"
-                 . "*ASSIGN <name> <task>* — Quick task\n"
-                 . "*ASSIGN <name>* — Multi-message task (DONE to finalize)\n"
-                 . "  💡 Files (image/PDF/Excel/Word/PPT) bhej, *DONE* type karke send\n"
+                 . "*ASSIGN <name> [task text]* — Start building a task\n"
+                 . "  💡 Phir bhejo: text, image, PDF, Excel, Word, PPT (kuch bhi)\n"
+                 . "  💡 Last me *DONE* — sab employee tak ek task me forward\n"
+                 . "  💡 *CANCEL* karke abort kar sakte ho\n\n"
                  . "*ADD EMPLOYEE <name> <phone> <role>* — Add employee\n"
                  . "*LIST* — Show team (basic)\n"
                  . "*ALL* — Show team with task counts\n"
-                 . "*TEAM* — Show team tree with counts\n"
-                 . "*STATUS <name>* — Detailed employee status with delays\n"
+                 . "*TEAM* — Team tree with counts\n"
+                 . "*STATUS <name>* — Detailed status with delays\n"
                  . "*CANCEL T-xxx [reason]* — Cancel a task\n"
                  . "*REASSIGN T-xxx <name>* — Move task to someone else\n"
-                 . "*REOPEN T-xxx [reason]* — Reopen completed/verified task\n"
+                 . "*REOPEN T-xxx [reason]* — Reopen completed task\n"
                  . "*REPORT TODAY* / *REPORT WEEK* — Stats\n"
-                 . "*VERIFY T-xxx* — Approve completed task\n"
-                 . "*REJECT T-xxx <reason>* — Reject\n\n"
+                 . "*VERIFY T-xxx* / *REJECT T-xxx <reason>*\n\n"
                  . "📊 *Quick filters:* URGENT • HIGH • TODAY • OVERDUE • PENDING\n\n"
-                 . "💬 *Chat modes:*\n"
-                 . "  *CHAT <name>* — open conversation (CLOSE to exit)\n"
-                 . "  *CHAT <name> <message>* — one-shot DM\n"
-                 . "  *REPLY <message>* — respond to last received chat\n\n"
-                 . "Example: ASSIGN Parag visit Dr. Patel today by 5PM";
+                 . "💬 *Chat:* CHAT <name> [+message]  •  REPLY <message>  •  CLOSE\n\n"
+                 . "Example:\nASSIGN Parag fix the homepage\n[image]\n[PDF]\nalso mobile responsive\nDONE";
         }
 
         return "📋 *Employee Commands*\n\n"
@@ -1604,10 +1651,7 @@ class CommandHandler
              . "*STATUS* — View all my tasks\n"
              . "*SCORE* — My APIX\n\n"
              . "📊 *Quick filters:* URGENT • HIGH • TODAY • OVERDUE • PENDING\n\n"
-             . "💬 *Chat modes:*\n"
-             . "  *CHAT <name>* — open conversation (CLOSE to exit)\n"
-             . "  *CHAT <name> <message>* — one-shot DM\n"
-             . "  *REPLY <message>* — respond to last received chat\n\n"
+             . "💬 *Chat:* CHAT <name> [+message]  •  REPLY <message>  •  CLOSE\n\n"
              . "💡 Multiple tasks? Bot list dega — phir *START 1*, *COMPLETE 2*, ya sirf *1*, *2* etc.";
     }
 
@@ -1772,15 +1816,16 @@ class CommandHandler
 
             $this->clearSessionAwaiting($user);
 
-            // Extract task title from original (skip first 2 words: ASSIGN <name>)
+            // Extract initial text from original (skip first 2 words: ASSIGN <name>)
             $parts = preg_split('/\s+/', trim($originalMessage), 3);
-            $taskTitle = $parts[2] ?? 'Unnamed task';
+            $initialText = $parts[2] ?? null;
 
             if (!$user->canAssignTo($candidate)) {
                 return "🚫 *Not allowed*\n\n\"{$candidate->name}\" is not in your team.";
             }
 
-            return $this->createAndNotifyTask($user, $candidate, $taskTitle);
+            // Always enter batch mode (same as direct ASSIGN flow)
+            return $this->startBatchTask($user, $candidate, null, $initialText);
         }
 
         return null;

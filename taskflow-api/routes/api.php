@@ -8,6 +8,7 @@ use App\Http\Controllers\Api\AnalyticsController;
 use App\Http\Controllers\Api\AIController;
 use App\Http\Controllers\Api\WebhookController;
 use App\Http\Controllers\Api\LogsController;
+use App\Http\Controllers\Api\SystemController;
 
 Route::get('/health', function () {
     try { \DB::connection()->getPdo(); $db = 'connected'; }
@@ -17,6 +18,23 @@ Route::get('/health', function () {
 
 Route::get('/webhooks/whatsapp', [WebhookController::class, 'verify']);
 Route::post('/webhooks/whatsapp', [WebhookController::class, 'handle']);
+
+// ──────────────────────────────────────────────────────────────
+// System cron endpoints — for external cron service (no shell needed)
+// Protected by SYSTEM_SECRET env var, NOT sanctum auth.
+// ──────────────────────────────────────────────────────────────
+Route::prefix('system')->group(function () {
+    Route::get('/health',             [SystemController::class, 'health']);
+    Route::post('/run/reports-daily', [SystemController::class, 'runReportsDaily']);
+    Route::post('/run/auto-verify',   [SystemController::class, 'runAutoVerify']);
+    Route::post('/run/media-cleanup', [SystemController::class, 'runMediaCleanup']);
+    Route::post('/run/finalize-stale-batches', [SystemController::class, 'runFinalizeStaleBatches']);
+    // Allow GET as well so simple cron services (which often only do GET) work too
+    Route::get('/run/reports-daily',  [SystemController::class, 'runReportsDaily']);
+    Route::get('/run/auto-verify',    [SystemController::class, 'runAutoVerify']);
+    Route::get('/run/media-cleanup',  [SystemController::class, 'runMediaCleanup']);
+    Route::get('/run/finalize-stale-batches', [SystemController::class, 'runFinalizeStaleBatches']);
+});
 
 Route::prefix('auth')->group(function () {
     Route::post('/login', [AuthController::class, 'login']);

@@ -34,5 +34,10 @@ return Application::configure(basePath: dirname(__DIR__))
         $schedule->command('media:cleanup')
             ->everyThirtyMinutes()
             ->withoutOverlapping();
+
+        // Auto-finalize stale task batches every minute (2-min idle rule)
+        $schedule->command('batches:finalize-stale')
+            ->everyMinute()
+            ->withoutOverlapping();
     })
     ->withExceptions(function (Exceptions $exceptions) {})->create();
