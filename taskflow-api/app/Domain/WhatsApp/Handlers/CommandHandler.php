@@ -129,8 +129,8 @@ class CommandHandler
             'DM'       => $this->handleChat($user, $fullMessage),
             'REPLY'    => $this->handleReply($user, $fullMessage),
             // Phase 3 — CLOSE when NOT in chat: just inform user
-            'CLOSE'    => "ℹ️ Aap kisi chat session me nahi hain.\n\nReply *HELP* for commands.",
-            'END'      => "ℹ️ Aap kisi chat session me nahi hain.\n\nReply *HELP* for commands.",
+            'CLOSE'    => "ℹ️ You're not in a chat session.\n\nReply *HELP* for commands.",
+            'END'      => "ℹ️ You're not in a chat session.\n\nReply *HELP* for commands.",
             default    => $this->handleUnknown($user, $fullMessage, $waMessageId),
         };
     }
@@ -158,7 +158,7 @@ class CommandHandler
     {
         $parts = preg_split('/\s+/', trim($message), 3);
         if (count($parts) < 2) {
-            return "❌ *Invalid format*\n\nUse: *ASSIGN <name> [optional task text]*\n\nExample:\nASSIGN Parag fix the homepage\n\nFiles/images/PDFs jo bhi bhejo, sab is task me jud jayenge. Last me *DONE* bhejke send karo.";
+            return "❌ *Invalid format*\n\nUse: *ASSIGN <name> [optional task text]*\n\nExample:\nASSIGN Parag fix the homepage\n\nSend any files (images/PDFs/Excel/Word/PPT) and they will be added to this task. Send *DONE* at the end to finalize.";
         }
 
         $employeeName = $parts[1];
@@ -684,15 +684,61 @@ class CommandHandler
 
     private function handleUnknown(User $user, string $message, ?string $waMessageId): string
     {
-        // First check: does this look like an attempted command with a typo?
-        $firstWord = strtoupper(explode(' ', trim($message))[0] ?? '');
+        $trimmed = trim($message);
+        $firstWord = strtoupper(explode(' ', $trimmed)[0] ?? '');
+
+        // ── Manager-only: bare employee name → show their status ──
+        // E.g., admin types "Parag" (not "STATUS Parag") → still get status
+        if ($user->isManager() && $trimmed !== '' && preg_match('/^[A-Za-z][A-Za-z .]{1,40}$/', $trimmed)) {
+            $wordCount = count(preg_split('/\s+/', $trimmed));
+            if ($wordCount <= 2) {
+                $matches = User::where('is_active', true)
+                    ->where('id', '!=', $user->id)
+                    ->whereRaw('LOWER(name) LIKE ?', ['%' . strtolower($trimmed) . '%'])
+                    ->get();
+                $manageable = $matches->filter(fn($c) => $user->canAssignTo($c))->values();
+
+                if ($manageable->count() === 1) {
+                    // Single match — show status directly
+                    return $this->handleEmployeeStatus($user, "STATUS " . $manageable->first()->name);
+                }
+                if ($manageable->count() > 1) {
+                    // Multiple — disambiguate
+                    $msg = "🤔 Multiple matches for *{$trimmed}*:\n\n";
+                    foreach ($manageable as $i => $c) {
+                        $msg .= "*" . ($i + 1) . ".* {$c->name}";
+                        if ($c->designation) $msg .= " — {$c->designation}";
+                        $msg .= "\n";
+                    }
+                    $msg .= "\nReply: *STATUS <full name>* for details.";
+                    return $msg;
+                }
+                // No match — fall through to typo / help
+            }
+        }
+
+        // ── Natural-language intent detection (rule-based, no AI) ──
+        // Handles phrases like:
+        //   "Please assign parag create new file"      → ASSIGN
+        //   "parag ko ye kaam de do submit report"     → ASSIGN
+        //   "what is parag doing?"                     → STATUS
+        //   "Parag kis par kaam kar raha hai"          → STATUS
+        //   "show full team status"                    → ALL/LIST
+        $intent = $this->detectNaturalIntent($user, $trimmed);
+        if ($intent !== null) {
+            return $this->routeNaturalIntent($user, $intent, $waMessageId);
+        }
+
+        // ── Typo suggestion: did you mean a known command? ──
         if (strlen($firstWord) >= 3) {
             $known = [
                 // employee
                 'START', 'UPDATE', 'COMPLETE', 'DELAY', 'ESCALATE', 'SCORE', 'STATUS', 'HELP',
                 'URGENT', 'HIGH', 'TODAY', 'OVERDUE', 'PENDING', 'CHAT', 'REPLY',
+                'DONE', 'CANCEL', 'ABORT', 'FINISH', 'CLOSE',
                 // manager
-                'ASSIGN', 'LIST', 'TEAM', 'VERIFY', 'REJECT', 'REPORT', 'CANCEL', 'REASSIGN', 'FORWARD',
+                'ASSIGN', 'LIST', 'TEAM', 'ALL', 'VERIFY', 'REJECT', 'REPORT',
+                'REASSIGN', 'FORWARD', 'REOPEN',
             ];
             $bestMatch = null;
             $bestDist = 99;
@@ -700,13 +746,12 @@ class CommandHandler
                 $d = levenshtein($firstWord, $cmd);
                 if ($d < $bestDist) { $bestDist = $d; $bestMatch = $cmd; }
             }
-            // Only suggest if very close (1 or 2 char diff) — and word isn't exact match (which would have been parsed already)
             if ($bestDist > 0 && $bestDist <= 2) {
-                return "🤔 *\"{$firstWord}\"* samajh nahi aaya.\n\n💡 Kya tu *{$bestMatch}* keh raha tha?\n\nReply *HELP* for full command list.";
+                return "🤔 I didn't understand *\"{$firstWord}\"*.\n\n💡 Did you mean *{$bestMatch}*?\n\nReply *HELP* for the full command list.";
             }
         }
 
-        // Otherwise — fall back to existing behavior: log as raw update on active task if msg is substantial
+        // ── Fallback: log as raw update on active task if message is substantial ──
         $task = $this->getActiveTask($user);
         if ($task && strlen($message) > 10) {
             $this->logUpdate($task, $user, 'update', $message, $waMessageId);
@@ -718,6 +763,216 @@ class CommandHandler
             return "📝 Update logged.\n\nSend *HELP* for commands.";
         }
         return $this->helpMessage($user);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // PHASE 5 — NATURAL LANGUAGE INTENT DETECTION (rule-based, no AI)
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * Try to figure out what the user wants from free-form text.
+     * Returns ['intent' => 'assign|status|complete|list', 'target' => User, ...] or null.
+     */
+    private function detectNaturalIntent(User $user, string $message): ?array
+    {
+        if (strlen($message) < 4) return null;
+
+        $lower = ' ' . strtolower($message) . ' ';
+
+        // Find the mentioned person (if any)
+        $target = $this->findUserMentionedIn($message, $user);
+
+        // Question-y signals push toward STATUS over ASSIGN
+        $isQuestion = (str_contains($message, '?') ||
+            (bool) preg_match('/\b(kya|kis|kaun|kahan|kab|what|how|where|when|which|why)\b/i', $message));
+
+        // Keyword score per intent
+        $scores = ['status' => 0, 'assign' => 0, 'complete' => 0, 'list' => 0];
+
+        // ─── STATUS keywords ───
+        $statusKw = [
+            'kis par kaam', 'kis pr kaam', 'kis par work', 'kya kar rah', 'kya kar rha',
+            'kaam kya', 'kya kaam', 'kaam batao', 'task batao', 'task kya',
+            'what is doing', 'what are doing', 'what doing', 'whats doing', "what's doing",
+            'doing what', 'working on', 'progress of', 'status of',
+            'progress kya', 'how is doing', 'how is', "how's",
+            ' doing ', ' working ', ' status ', ' progress ',
+        ];
+        foreach ($statusKw as $kw) {
+            if (str_contains($lower, $kw)) $scores['status']++;
+        }
+        if ($isQuestion) $scores['status']++;
+
+        // ─── ASSIGN keywords ───
+        $assignKw = [
+            'assign', 'please assign', 'delegate',
+            'kaam de do', 'kaam dedo', 'kaam de ', 'kaam do ', 'kaam dena',
+            'task de do', 'task dedo', 'task de ', 'task do ',
+            'task dena', 'task assign',
+            ' de do ', ' dedo ', ' de dena ',
+            'ko de ', 'ko dedo', 'ko de do',
+            'create task', 'new task', 'naya kaam', 'naya task',
+            'ye kaam', 'yeh kaam', 'is kaam',
+            'give task', 'give the task', 'give him task', 'give her task',
+            'karwa do', 'karwado',
+        ];
+        foreach ($assignKw as $kw) {
+            if (str_contains($lower, $kw)) $scores['assign']++;
+        }
+        if ($isQuestion) $scores['assign']--;
+
+        // ─── COMPLETE keywords ───
+        $completeKw = [
+            'complete kar', 'complete kr', 'mark done', 'mark complete',
+            'done kar', 'finish kar', 'finished',
+            'ho gaya', 'khatam', 'task done',
+        ];
+        foreach ($completeKw as $kw) {
+            if (str_contains($lower, $kw)) $scores['complete']++;
+        }
+
+        // ─── LIST/ALL keywords ───
+        $listKw = [
+            'show team', 'show all', 'list team', 'list of team', 'whole team',
+            'all task', 'puri team', 'team dikha', 'sab dikha', 'everyone',
+            'all employee',
+        ];
+        foreach ($listKw as $kw) {
+            if (str_contains($lower, $kw)) $scores['list']++;
+        }
+
+        // Pick best
+        arsort($scores);
+        $topIntent = key($scores);
+        $topScore  = $scores[$topIntent];
+        if ($topScore <= 0) return null;
+
+        // ASSIGN and STATUS need a target person
+        if ($topIntent === 'status') {
+            if (!$target) return null;
+            return ['intent' => 'status', 'target' => $target];
+        }
+        if ($topIntent === 'assign') {
+            if (!$target) return null;
+            $taskText = $this->extractTaskFromMessage($message, $target);
+            return ['intent' => 'assign', 'target' => $target, 'task' => $taskText];
+        }
+        if ($topIntent === 'list') {
+            return ['intent' => 'list'];
+        }
+        // COMPLETE — needs task selection, skip natural-lang for now
+        return null;
+    }
+
+    /**
+     * Find an active user mentioned in the message (by full name or first name).
+     */
+    private function findUserMentionedIn(string $message, User $askingUser): ?User
+    {
+        $lower = strtolower($message);
+        $allUsers = User::where('is_active', true)
+            ->where('id', '!=', $askingUser->id)
+            ->get();
+
+        // Try longest match first (full name)
+        $best = null;
+        $bestLen = 0;
+        foreach ($allUsers as $u) {
+            $nameLower = strtolower($u->name);
+            if (strlen($nameLower) >= 3 && str_contains($lower, $nameLower) && strlen($nameLower) > $bestLen) {
+                $best = $u;
+                $bestLen = strlen($nameLower);
+            }
+        }
+        if ($best) return $best;
+
+        // First name match (word boundary)
+        foreach ($allUsers as $u) {
+            $firstName = strtolower(explode(' ', $u->name)[0]);
+            if (strlen($firstName) >= 3 && preg_match('/\b' . preg_quote($firstName, '/') . '\b/i', $message)) {
+                return $u;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Strip the assign-intent fluff from a message to extract just the task description.
+     */
+    private function extractTaskFromMessage(string $message, User $target): string
+    {
+        $cleaned = $message;
+
+        // Remove the target's full name and first name
+        $cleaned = preg_replace('/\b' . preg_quote($target->name, '/') . '\b/i', '', $cleaned);
+        $firstName = explode(' ', $target->name)[0];
+        if (strlen($firstName) >= 3) {
+            $cleaned = preg_replace('/\b' . preg_quote($firstName, '/') . '\b/i', '', $cleaned);
+        }
+
+        // Remove common assign-intent stopwords (multi-word first to avoid partial matches)
+        $stopwords = [
+            'please assign', 'kindly assign', 'pls assign',
+            'kaam de do', 'kaam dedo', 'kaam de dena', 'kaam de', 'kaam do',
+            'task de do', 'task dedo', 'task de', 'task do', 'task dena',
+            'ko de do', 'ko dedo', 'ko de',
+            'create task', 'new task', 'create a task', 'add task',
+            'naya kaam', 'naya task', 'ye kaam', 'yeh kaam', 'is kaam',
+            'give task', 'give the task', 'give him', 'give her',
+            'karwa do', 'karwado',
+            'please', 'pleas', 'plz', 'kindly',
+            'assign', 'delegate', 'task',
+        ];
+        foreach ($stopwords as $sw) {
+            $cleaned = preg_replace('/\b' . preg_quote($sw, '/') . '\b/i', '', $cleaned);
+        }
+
+        // Cleanup punctuation + spaces
+        $cleaned = preg_replace('/[,;:]+/', ' ', $cleaned);
+        $cleaned = preg_replace('/\s+/', ' ', $cleaned);
+        $cleaned = trim($cleaned, " \t\n\r.-");
+
+        return $cleaned;
+    }
+
+    /**
+     * Route a detected natural-language intent to the right handler.
+     * Prepends a "🧠 Understood as: ..." line for transparency.
+     */
+    private function routeNaturalIntent(User $user, array $intent, ?string $waMessageId): string
+    {
+        $type = $intent['intent'];
+
+        if ($type === 'status' && isset($intent['target'])) {
+            $target = $intent['target'];
+            $understanding = "🧠 *Understood as:* Status check for *{$target->name}*\n\n———\n\n";
+            return $understanding . $this->handleEmployeeStatus($user, "STATUS " . $target->name);
+        }
+
+        if ($type === 'assign' && isset($intent['target'])) {
+            if (!$user->isManager()) {
+                return "🚫 Only managers can assign tasks.";
+            }
+            $target = $intent['target'];
+            $taskText = $intent['task'] ?? '';
+            $understanding = "🧠 *Understood as:* Assign to *{$target->name}*"
+                . ($taskText !== '' ? " — \"" . $taskText . "\"" : "")
+                . "\n\n———\n\n";
+
+            $synthetic = "ASSIGN " . $target->name;
+            if ($taskText !== '') $synthetic .= " " . $taskText;
+            return $understanding . $this->handleAssign($user, $synthetic);
+        }
+
+        if ($type === 'list') {
+            if ($user->isManager()) {
+                $understanding = "🧠 *Understood as:* Show full team overview\n\n———\n\n";
+                return $understanding . $this->handleAll($user);
+            }
+            return "Reply *STATUS* to view your own tasks.";
+        }
+
+        return "";
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -777,7 +1032,7 @@ class CommandHandler
                        ->get();
 
         if ($tasks->isEmpty()) {
-            return "{$label}\n\n✨ Koi {$filter} task nahi hai. Sab clear!";
+            return "{$label}\n\n✨ No {$filter} tasks. All clear!";
         }
 
         $msg = "{$label} — *{$tasks->count()}* tasks:\n\n";
@@ -802,7 +1057,7 @@ class CommandHandler
     private function handleCancel(User $user, string $message): string
     {
         if (!$user->isManager()) {
-            return "🚫 Sirf manager/admin task cancel kar sakte hain.";
+            return "🚫 Only managers/admins can cancel tasks.";
         }
 
         $parts = preg_split('/\s+/', trim($message), 3);
@@ -822,11 +1077,11 @@ class CommandHandler
         }
 
         if ($task->assigned_by !== $user->id && !($task->assignedTo && $user->canAssignTo($task->assignedTo))) {
-            return "🚫 Yeh task tumne assign nahi kiya — cancel nahi kar sakte.";
+            return "🚫 You didn't assign this task — you can't cancel it.";
         }
 
         if (in_array($task->status, ['completed', 'verified', 'cancelled'])) {
-            return "⚠️ Task already *{$task->status}* hai — cancel nahi kar sakte.";
+            return "⚠️ Task is already *{$task->status}* — cannot be cancelled.";
         }
 
         $task->update(['status' => 'cancelled']);
@@ -855,7 +1110,7 @@ class CommandHandler
     private function handleReassign(User $user, string $message): string
     {
         if (!$user->isManager()) {
-            return "🚫 Sirf manager/admin task reassign kar sakte hain.";
+            return "🚫 Only managers/admins can reassign tasks.";
         }
 
         $parts = preg_split('/\s+/', trim($message), 3);
@@ -875,11 +1130,11 @@ class CommandHandler
         }
 
         if ($task->assigned_by !== $user->id && !($task->assignedTo && $user->canAssignTo($task->assignedTo))) {
-            return "🚫 Yeh task tumne assign nahi kiya — reassign nahi kar sakte.";
+            return "🚫 You didn't assign this task — you can't reassign it.";
         }
 
         if (in_array($task->status, ['completed', 'verified', 'cancelled'])) {
-            return "⚠️ Task *{$task->status}* hai — reassign nahi kar sakte.";
+            return "⚠️ Task is *{$task->status}* — cannot be reassigned.";
         }
 
         // Find new employee
@@ -893,7 +1148,7 @@ class CommandHandler
             ->values();
 
         if ($candidates->isEmpty()) {
-            return "❌ \"{$newName}\" team me nahi mila. Reply *LIST*.";
+            return "❌ \"{$newName}\" not found in your team. Reply *LIST*.";
         }
         if ($candidates->count() > 1) {
             $msg = "🤔 Multiple matches for *{$newName}*:\n\n";
@@ -921,7 +1176,7 @@ class CommandHandler
         // Notify old employee
         if ($oldEmployee && $oldEmployee->phone) {
             $this->wa->sendMessage($oldEmployee->phone,
-                "🔄 *Task Removed*\n\n📋 " . $task->title . "\nTask ab {$newEmployee->name} ko assign ho gaya hai."
+                "🔄 *Task Removed*\n\n📋 " . $task->title . "\nTask is now assigned to {$newEmployee->name}."
             );
         }
 
@@ -987,7 +1242,7 @@ class CommandHandler
 
         $target = $candidates->first();
         if (!$target->phone) {
-            return "❌ {$target->name} ke paas phone number nahi hai — message bhej nahi sakte.";
+            return "❌ {$target->name} has no phone number — cannot send message.";
         }
 
         // Send forwarded message to target via bot
@@ -1026,7 +1281,7 @@ class CommandHandler
         $expires = $state['last_chat_expires_at'] ?? null;
 
         if (!$fromId) {
-            return "❌ Tumhe abhi koi message nahi mila reply karne ke liye.\n\nUse *CHAT <name> <message>* to start a chat.";
+            return "❌ You have no incoming message to reply to.\n\nUse *CHAT <name> <message>* to start a chat.";
         }
 
         if ($expires) {
@@ -1045,12 +1300,12 @@ class CommandHandler
 
         $target = User::find($fromId);
         if (!$target || !$target->phone) {
-            return "❌ Original sender available nahi hai.";
+            return "❌ Original sender is unavailable.";
         }
 
         $cleanReply = trim(preg_replace('/^REPLY\s*/i', '', $message));
         if ($cleanReply === '') {
-            return "❌ Reply blank hai. Use: *REPLY <your message>*";
+            return "❌ Reply is empty. Use: *REPLY <your message>*";
         }
 
         $forwarded = "💬 *{$sender->name} replied:*\n\n{$cleanReply}\n\n_Reply with *REPLY <message>* to continue._";
@@ -1112,7 +1367,7 @@ class CommandHandler
         ], 60); // 60 min hard expiry (selection slot)
 
         $intro = "📦 *Building task for {$employee->name}*\n\n"
-               . "Ab text, images, PDF, Excel, Word, PPT — kuch bhi bhej do, sab is task me jud jayega.\n\n"
+               . "Now send anything — text, images, PDFs, Excel, Word, PPT — it will all be added to this task.\n\n"
                . "Type *DONE* to finalize and send.\n"
                . "Type *CANCEL* to abort.\n"
                . "_⏰ Auto-sends after 2 min idle._\n";
@@ -1149,7 +1404,7 @@ class CommandHandler
         }
 
         if (empty($added)) {
-            return "📦 *Batch open*\n\nKuch nahi mila add karne ke liye. Type *DONE* to finalize.";
+            return "📦 *Batch open*\n\nNothing to add. Type *DONE* to finalize.";
         }
 
         $state['buffered_text']    = $textLines;
@@ -1165,7 +1420,7 @@ class CommandHandler
         return "✓ Added " . implode(' + ', $added) . " to task for *{$forName}*\n"
              . "📝 {$textCount} text · 📎 {$mediaCount} files\n\n"
              . "Type *DONE* to send, *CANCEL* to abort.\n"
-             . "_⏰ Auto-send after 2 min idle._";
+             . "_⏰ Auto-sends after 2 min idle._";
     }
 
     /**
@@ -1189,16 +1444,16 @@ class CommandHandler
             return "❌ Batch state lost. Try again with *ASSIGN <name>*.";
         }
         if (empty($textLines) && empty($mediaIds)) {
-            return "❌ Batch khaali hai. *ASSIGN <name>* karke phir se shuru karo.";
+            return "❌ Batch is empty. Use *ASSIGN <name>* to start fresh.";
         }
 
         $employee = User::find($employeeId);
         if (!$employee || !$employee->is_active) {
-            return "❌ Employee ab available nahi hai. Batch discard.";
+            return "❌ Employee is no longer available. Discarding batch.";
         }
 
         if (!$manager->canAssignTo($employee)) {
-            return "🚫 Aap *{$employee->name}* ko ab assign nahi kar sakte.";
+            return "🚫 You can no longer assign to *{$employee->name}*.";
         }
 
         // Build title — first non-empty text, or fallback
@@ -1294,7 +1549,7 @@ class CommandHandler
         $manager->wa_session_state = empty($state) ? null : $state;
         $manager->save();
 
-        return "🚫 *Batch cancelled*" . ($forName ? " (was building for {$forName})" : "") . "\n\nNormal commands ab kaam karenge.";
+        return "🚫 *Batch cancelled*" . ($forName ? " (was building for {$forName})" : "") . "\n\nNormal commands will work now.";
     }
 
     /**
@@ -1313,7 +1568,7 @@ class CommandHandler
             }
             $user->wa_session_state = empty($state) ? null : $state;
             $user->save();
-            return "❌ Peer ab available nahi hai. Chat auto-closed.";
+            return "❌ Peer is no longer available. Chat auto-closed.";
         }
 
         if (!is_readable($waMedia->file_path)) {
@@ -1330,7 +1585,7 @@ class CommandHandler
         );
 
         if (!$ok) {
-            return "⚠️ *{$peer->name}* ko file deliver nahi hui.";
+            return "⚠️ *{$peer->name}* couldn't deliver the file.";
         }
         return ""; // silent
     }
@@ -1352,7 +1607,7 @@ class CommandHandler
         $manageable = $employees->filter(fn($e) => $manager->canAssignTo($e))->values();
 
         if ($manageable->isEmpty()) {
-            return "❌ Aapke team me koi assignable employee nahi hai.\n\nReply *TEAM* to see hierarchy.";
+            return "❌ Your team has no assignable employees.\n\nReply *TEAM* to see hierarchy.";
         }
 
         $msg = "👥 *Team Overview — {$manageable->count()} people*\n\n";
@@ -1419,22 +1674,22 @@ class CommandHandler
 
         $target = $candidates->first();
         if (!$target->phone) {
-            return "❌ {$target->name} ke paas phone number nahi hai.";
+            return "❌ {$target->name} has no phone number.";
         }
 
         // If target is already in chat with someone OTHER than sender, block
         $targetState = is_array($target->wa_session_state) ? $target->wa_session_state : [];
         if (!empty($targetState['in_chat_with_id']) && $targetState['in_chat_with_id'] !== $sender->id) {
-            return "❌ *{$target->name}* abhi kisi aur ke saath chat me hai. Thodi der baad try karo.";
+            return "❌ *{$target->name}* is currently in another chat. Try again later.";
         }
 
         // Notify target FIRST — if fails, don't change state
-        $notify = "💬 *{$sender->name}* aapse chat shuru kar raha hai.\n\n"
-                . "Ab aapka koi bhi message direct *{$sender->name}* ko jayega.\n"
-                . "🔚 Chat khatam karne ke liye *CLOSE* bhejo.";
+        $notify = "💬 *{$sender->name}* wants to start a chat with you.\n\n"
+                . "Anything you send now goes directly to *{$sender->name}*.\n"
+                . "🔚 Send *CLOSE* to end the chat.";
 
         if (!$this->wa->sendMessage($target->phone, $notify)) {
-            return "⚠️ *{$target->name}* ko notify nahi kar paye. Check Logs tab.";
+            return "⚠️ *{$target->name}* could not be notified. Check Logs tab.";
         }
 
         // Set BOTH sides
@@ -1460,9 +1715,9 @@ class CommandHandler
         );
 
         return "💬 *Chat with {$target->name} started!*\n\n"
-             . "Ab aapka koi bhi message direct *{$target->name}* ko jayega.\n"
-             . "Other commands abhi work nahi karenge.\n\n"
-             . "🔚 Chat khatam karne ke liye *CLOSE* bhejo.";
+             . "Anything you send now goes directly to *{$target->name}*.\n"
+             . "Other commands won't work right now.\n\n"
+             . "🔚 Send *CLOSE* to end the chat.";
     }
 
     /**
@@ -1497,7 +1752,7 @@ class CommandHandler
 
             if (!$silentForPeer && $peer->phone) {
                 $this->wa->sendMessage($peer->phone,
-                    "🔚 *{$user->name}* ne chat close kar di.\n\nNormal commands ab kaam karenge."
+                    "🔚 *{$user->name}* closed the chat.\n\nNormal commands will work now."
                 );
             }
         }
@@ -1508,7 +1763,7 @@ class CommandHandler
             ['user_id' => $user->id, 'peer_id' => $peerId]
         );
 
-        return "🔚 *Chat with {$peerName} closed.*\n\nNormal commands ab kaam karenge.";
+        return "🔚 *Chat with {$peerName} closed.*\n\nNormal commands will work now.";
     }
 
     /**
@@ -1532,14 +1787,14 @@ class CommandHandler
             }
             $user->wa_session_state = empty($state) ? null : $state;
             $user->save();
-            return "❌ Peer ab available nahi hai. Chat auto-closed.\n\nNormal commands ab kaam karenge.";
+            return "❌ Peer is no longer available. Chat auto-closed.\n\nNormal commands will work now.";
         }
 
         $forwarded = "💬 *{$user->name}:* {$text}";
         $delivered = $this->wa->sendMessage($peer->phone, $forwarded);
 
         if (!$delivered) {
-            return "⚠️ *{$peer->name}* ko message deliver nahi hua.\n\nSend *CLOSE* to exit chat.";
+            return "⚠️ *{$peer->name}* could not be delivered.\n\nSend *CLOSE* to exit chat.";
         }
 
         // Empty reply = no echo to sender (natural chat feel)
@@ -1558,7 +1813,7 @@ class CommandHandler
     {
         $parts = preg_split('/\s+/', trim($message), 3);
         if (count($parts) < 2) {
-            return "❌ *Format*\n\n*REOPEN T-xxx [reason]*\n\nExample: REOPEN T-019e94 client ko aur changes chahiye";
+            return "❌ *Format*\n\n*REOPEN T-xxx [reason]*\n\nExample: REOPEN T-019e94 client wants more changes";
         }
 
         $shortId = strtolower(str_replace('T-', '', $parts[1]));
@@ -1577,11 +1832,11 @@ class CommandHandler
                      || ($task->assigned_by === $user->id)
                      || ($user->role === 'admin');
         if (!$isAuthorized) {
-            return "🚫 Yeh task tumse related nahi hai — reopen nahi kar sakte.";
+            return "🚫 This task is not associated with you — cannot be reopened.";
         }
 
         if (!in_array($task->status, ['completed', 'verified'])) {
-            return "⚠️ Task *{$task->status}* hai — reopen nahi kar sakte. Sirf completed/verified tasks reopen ho sakte hain.";
+            return "⚠️ Task *{$task->status}* hai — cannot be reopened. Only completed/verified tasks can be reopened.";
         }
 
         $previousStatus = $task->status;
@@ -1604,7 +1859,7 @@ class CommandHandler
                 . "📋 " . $task->title . "\n"
                 . "👤 By: {$user->name}\n"
                 . "Reason: {$reason}\n\n"
-                . "Status ab *in_progress* hai."
+                . "Status is now *in_progress*."
             );
         }
 
@@ -1623,9 +1878,9 @@ class CommandHandler
         if ($user->isManager()) {
             return "📋 *Manager Commands*\n\n"
                  . "*ASSIGN <name> [task text]* — Start building a task\n"
-                 . "  💡 Phir bhejo: text, image, PDF, Excel, Word, PPT (kuch bhi)\n"
-                 . "  💡 Last me *DONE* — sab employee tak ek task me forward\n"
-                 . "  💡 *CANCEL* karke abort kar sakte ho\n\n"
+                 . "  💡 Then send: text, images, PDFs, Excel, Word, PPT (anything)\n"
+                 . "  💡 Last *DONE* — forwards everything to the employee as one task\n"
+                 . "  💡 *CANCEL* to abort\n\n"
                  . "*ADD EMPLOYEE <name> <phone> <role>* — Add employee\n"
                  . "*LIST* — Show team (basic)\n"
                  . "*ALL* — Show team with task counts\n"
@@ -1652,7 +1907,7 @@ class CommandHandler
              . "*SCORE* — My APIX\n\n"
              . "📊 *Quick filters:* URGENT • HIGH • TODAY • OVERDUE • PENDING\n\n"
              . "💬 *Chat:* CHAT <name> [+message]  •  REPLY <message>  •  CLOSE\n\n"
-             . "💡 Multiple tasks? Bot list dega — phir *START 1*, *COMPLETE 2*, ya sirf *1*, *2* etc.";
+             . "💡 Bot will always show a numbered list — reply *START 1*, *COMPLETE 2*, or just *1*, *2*, etc.";
     }
 
     private function getActiveTask(User $user): ?Task
@@ -1705,45 +1960,43 @@ class CommandHandler
      * Resolve which task an employee command refers to.
      * Returns ['task' => Task] on success, ['reply' => string] when bot needs to ask user.
      *
-     * Rules:
+     * Rules (revised):
      * - 0 active tasks → reply: "no active task"
-     * - 1 active task  → use it (backward-compatible, current behavior unchanged)
-     * - 2+ active tasks + message has "COMMAND <number>" → pick that one
-     * - 2+ active tasks + no number → show numbered list, save session state
+     * - User explicitly included a number ("COMPLETE 2") → use that one
+     * - Otherwise → ALWAYS show numbered list & ask user to pick (even for 1 task)
      */
     private function resolveTaskForCommand(User $user, string $cmdName, string $fullMessage): array
     {
         $activeTasks = $this->getActiveTasksList($user);
 
         if ($activeTasks->isEmpty()) {
-            return ['reply' => "No active task found.\n\nReply *STATUS* to see your tasks."];
+            return ['reply' => "You have no active tasks.\n\nReply *STATUS* to view your tasks."];
         }
 
-        if ($activeTasks->count() === 1) {
-            return ['task' => $activeTasks->first()];
-        }
-
-        // Multiple — try to extract number after command word: "COMPLETE 2 ..." or "COMPLETE 2"
+        // If user already typed a number, honor it
         $hasNumber = preg_match('/^\s*[A-Za-z]+\s+(\d+)(?:\s|$)/', $fullMessage, $m);
         if ($hasNumber) {
             $idx = (int) $m[1];
             if ($idx >= 1 && $idx <= $activeTasks->count()) {
                 return ['task' => $activeTasks[$idx - 1]];
             }
-            return ['reply' => "⚠️ Galat number. Aapke paas *{$activeTasks->count()}* active tasks hain. Reply *STATUS* phir se dekhne ke liye."];
+            return ['reply' => "⚠️ Invalid number. You have *{$activeTasks->count()}* active task(s). Reply *STATUS* to see them again."];
         }
 
-        // No number — show numbered list + save session state for 10 min
+        // Otherwise — ALWAYS show numbered list and ask user to pick (even for 1 task)
         $cmdUpper = strtoupper($cmdName);
-        $msg = "🤔 Aapke paas *{$activeTasks->count()}* active tasks hain:\n\n";
+        $count = $activeTasks->count();
+        $taskWord = $count === 1 ? 'task' : 'tasks';
+        $msg = "📋 You have *{$count}* active {$taskWord}:\n\n";
         $options = [];
         foreach ($activeTasks as $i => $t) {
             $num = $i + 1;
             $msg .= "*{$num}.* " . $t->title . "\n";
             $options[$num] = $t->id;
         }
-        $msg .= "\nReply: *{$cmdUpper} 1*, *{$cmdUpper} 2*, etc.\n";
-        $msg .= "Ya sirf number bhejke: *1*, *2*, ...";
+        $msg .= "\nWhich one do you want to *{$cmdUpper}*?\n";
+        $msg .= "Reply: *{$cmdUpper} 1*, *{$cmdUpper} 2*, etc.\n";
+        $msg .= "Or just send the number: *1*, *2*, ...";
 
         $this->setSessionAwaiting($user, 'task_selection', [
             'command' => $cmdUpper,
@@ -1794,7 +2047,7 @@ class CommandHandler
             $activeTasks = $this->getActiveTasksList($user);
             $idx = $activeTasks->search(fn($t) => $t->id === $taskId);
             if ($idx === false) {
-                return "⚠️ Yeh task ab active nahi hai (shayad complete ho gaya). Reply *STATUS* dekhne ke liye.";
+                return "⚠️ This task is no longer active (probably completed). Reply *STATUS* to view your tasks.";
             }
             $currentNum = $idx + 1;
             // Recurse with synthetic full command e.g. "COMPLETE 2"
@@ -1811,7 +2064,7 @@ class CommandHandler
             $candidate = User::find($candidateId);
             if (!$candidate || !$candidate->is_active) {
                 $this->clearSessionAwaiting($user);
-                return "⚠️ Employee ab available nahi hai. Reply *LIST* dekhne ke liye.";
+                return "⚠️ Employee is no longer available. Reply *LIST* to see your team.";
             }
 
             $this->clearSessionAwaiting($user);
