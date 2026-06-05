@@ -1,5 +1,6 @@
 <?php
 
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
@@ -16,5 +17,17 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->alias([
             'throttle' => \Illuminate\Routing\Middleware\ThrottleRequests::class,
         ]);
+    })
+    ->withSchedule(function (Schedule $schedule) {
+        // Daily report to all employees at 7 PM IST
+        $schedule->command('reports:daily')
+            ->dailyAt('19:00')
+            ->timezone('Asia/Kolkata')
+            ->withoutOverlapping();
+
+        // Auto-verify completed tasks every 10 min (2-hour rule)
+        $schedule->command('tasks:auto-verify')
+            ->everyTenMinutes()
+            ->withoutOverlapping();
     })
     ->withExceptions(function (Exceptions $exceptions) {})->create();

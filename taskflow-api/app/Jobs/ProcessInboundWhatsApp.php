@@ -89,7 +89,19 @@ class ProcessInboundWhatsApp implements ShouldQueue
 
             // Single-word commands
             if (empty($command)) {
-                $singleWordCommands = ['ASSIGN', 'LIST', 'STATUS', 'VERIFY', 'REJECT', 'REPORT', 'START', 'UPDATE', 'COMPLETE', 'DELAY', 'ESCALATE', 'SCORE', 'HELP'];
+                $singleWordCommands = [
+                    // Existing commands
+                    'ASSIGN', 'LIST', 'STATUS', 'VERIFY', 'REJECT', 'REPORT',
+                    'START', 'UPDATE', 'COMPLETE', 'DELAY', 'ESCALATE', 'SCORE', 'HELP',
+                    // Phase 1 — query commands
+                    'URGENT', 'HIGH', 'TODAY', 'OVERDUE', 'PENDING',
+                    // Phase 1 — admin actions
+                    'CANCEL', 'REASSIGN', 'FORWARD', 'REOPEN',
+                    // Phase 2 — inter-user chat
+                    'CHAT', 'DM', 'REPLY',
+                    // Phase 3 — chat session close
+                    'CLOSE', 'END', 'BYE', 'EXIT',
+                ];
                 $firstWord = strtoupper(explode(' ', $text)[0] ?? '');
                 if (in_array($firstWord, $singleWordCommands)) {
                     $command = $firstWord;
@@ -110,7 +122,10 @@ class ProcessInboundWhatsApp implements ShouldQueue
 
             $reply = $handler->handle($user, $command, $text, $messageId);
 
-            $wa->sendMessage($phone, $reply);
+            // Empty/null reply means "no echo back to sender" (e.g. chat-mode silent forward)
+            if ($reply !== '' && $reply !== null) {
+                $wa->sendMessage($phone, $reply);
+            }
 
         } catch (\Exception $e) {
             ActivityLog::record(
