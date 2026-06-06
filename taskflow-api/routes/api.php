@@ -29,11 +29,13 @@ Route::prefix('system')->group(function () {
     Route::post('/run/auto-verify',   [SystemController::class, 'runAutoVerify']);
     Route::post('/run/media-cleanup', [SystemController::class, 'runMediaCleanup']);
     Route::post('/run/finalize-stale-batches', [SystemController::class, 'runFinalizeStaleBatches']);
+    Route::post('/run/dispatch-schedules',     [SystemController::class, 'runDispatchSchedules']);
     // Allow GET as well so simple cron services (which often only do GET) work too
     Route::get('/run/reports-daily',  [SystemController::class, 'runReportsDaily']);
     Route::get('/run/auto-verify',    [SystemController::class, 'runAutoVerify']);
     Route::get('/run/media-cleanup',  [SystemController::class, 'runMediaCleanup']);
     Route::get('/run/finalize-stale-batches', [SystemController::class, 'runFinalizeStaleBatches']);
+    Route::get('/run/dispatch-schedules',     [SystemController::class, 'runDispatchSchedules']);
 });
 
 Route::prefix('auth')->group(function () {

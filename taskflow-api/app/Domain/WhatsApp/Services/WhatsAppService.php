@@ -161,8 +161,8 @@ class WhatsAppService
                 return null;
             }
 
-            $url = $meta->json('url');
-            $mime = $meta->json('mime_type', $expectedMimeType ?? 'application/octet-stream');
+            $url  = $meta->json('url');
+            $mime = $this->normalizeMime($meta->json('mime_type', $expectedMimeType ?? 'application/octet-stream'));
             if (!$url) return null;
 
             // Step 2: Download the file binary
@@ -211,6 +211,8 @@ class WhatsAppService
     {
         if (!$this->enabled || !is_readable($localPath)) return null;
 
+        $mimeType = $this->normalizeMime($mimeType);
+
         try {
             $url = "https://graph.facebook.com/v21.0/{$this->phoneNumberId}/media";
 
@@ -224,8 +226,8 @@ class WhatsAppService
             if (!$resp->successful()) {
                 ActivityLog::record(
                     'whatsapp_out', 'media_upload', 'failed',
-                    "❌ Media upload to Meta rejected",
-                    ['status' => $resp->status(), 'body' => substr($resp->body(), 0, 300)]
+                    "❌ Media upload to Meta rejected (mime: {$mimeType})",
+                    ['status' => $resp->status(), 'body' => substr($resp->body(), 0, 400), 'path' => $localPath]
                 );
                 return null;
             }
@@ -250,7 +252,8 @@ class WhatsAppService
         if (!$this->enabled) return false;
 
         $cleanPhone = preg_replace('/[^\d]/', '', $to);
-        $waType = $this->mimeToWaType($mimeType);
+        $mimeType   = $this->normalizeMime($mimeType);
+        $waType     = $this->mimeToWaType($mimeType);
 
         $newMediaId = $this->uploadMedia($localPath, $mimeType);
         if (!$newMediaId) return false;
@@ -290,7 +293,7 @@ class WhatsAppService
             ActivityLog::record(
                 'whatsapp_out', 'send_media', 'failed',
                 "❌ Media send rejected: " . $resp->json('error.message', 'Unknown'),
-                ['status' => $resp->status(), 'body' => substr($resp->body(), 0, 300)],
+                ['status' => $resp->status(), 'body' => substr($resp->body(), 0, 400)],
                 $cleanPhone
             );
             return false;
@@ -306,10 +309,21 @@ class WhatsAppService
     }
 
     /**
+     * Strip MIME parameters (codecs, charset, etc.) — Meta API rejects them on upload.
+     * Example: "audio/ogg; codecs=opus" → "audio/ogg"
+     */
+    private function normalizeMime(string $mime): string
+    {
+        $parts = explode(';', $mime);
+        return trim($parts[0]);
+    }
+
+    /**
      * Map a MIME type to a WhatsApp message type.
      */
     public function mimeToWaType(string $mime): string
     {
+        $mime = $this->normalizeMime($mime);
         if (str_starts_with($mime, 'image/'))  return 'image';
         if (str_starts_with($mime, 'video/'))  return 'video';
         if (str_starts_with($mime, 'audio/'))  return 'audio';
@@ -321,12 +335,13 @@ class WhatsAppService
      */
     private function mimeToExtension(string $mime): string
     {
+        $mime = $this->normalizeMime($mime);
         $map = [
             'image/jpeg' => 'jpg', 'image/jpg' => 'jpg', 'image/png' => 'png',
-            'image/gif' => 'gif',  'image/webp' => 'webp',
-            'video/mp4' => 'mp4',  'video/3gpp' => '3gp',
-            'audio/mpeg' => 'mp3', 'audio/aac' => 'aac',  'audio/ogg' => 'ogg',
-            'audio/mp4' => 'm4a',  'audio/amr' => 'amr',
+            'image/gif'  => 'gif', 'image/webp' => 'webp',
+            'video/mp4'  => 'mp4', 'video/3gpp' => '3gp', 'video/quicktime' => 'mov',
+            'audio/mpeg' => 'mp3', 'audio/aac'  => 'aac',  'audio/ogg' => 'ogg',
+            'audio/mp4'  => 'm4a', 'audio/amr'  => 'amr',  'audio/wav' => 'wav',
             'application/pdf' => 'pdf',
             'application/vnd.ms-excel' => 'xls',
             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' => 'xlsx',
@@ -336,6 +351,7 @@ class WhatsAppService
             'application/vnd.openxmlformats-officedocument.presentationml.presentation' => 'pptx',
             'text/plain' => 'txt',
             'text/csv'   => 'csv',
+            'application/zip' => 'zip',
         ];
         return $map[$mime] ?? 'bin';
     }

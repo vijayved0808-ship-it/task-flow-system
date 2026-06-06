@@ -184,6 +184,8 @@ class ProcessInboundWhatsApp implements ShouldQueue
                     'CLOSE', 'END', 'BYE', 'EXIT',
                     // Phase 4 — team overview + batched assign markers
                     'ALL', 'DONE', 'FINISH', 'SEND', 'ABORT',
+                    // Phase 6 — recurring schedules
+                    'SCHEDULE', 'SCHEDULES', 'UNSCHEDULE',
                 ];
                 $firstWord = strtoupper(explode(' ', $text)[0] ?? '');
                 if (in_array($firstWord, $singleWordCommands)) {

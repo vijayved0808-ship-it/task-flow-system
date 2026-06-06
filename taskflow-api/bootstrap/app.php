@@ -39,5 +39,11 @@ return Application::configure(basePath: dirname(__DIR__))
         $schedule->command('batches:finalize-stale')
             ->everyMinute()
             ->withoutOverlapping();
+
+        // Dispatch scheduled recurring tasks once a day at 8 AM IST
+        $schedule->command('schedules:dispatch')
+            ->dailyAt('08:00')
+            ->timezone('Asia/Kolkata')
+            ->withoutOverlapping();
     })
     ->withExceptions(function (Exceptions $exceptions) {})->create();

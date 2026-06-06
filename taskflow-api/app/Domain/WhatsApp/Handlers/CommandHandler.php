@@ -3,6 +3,7 @@
 namespace App\Domain\WhatsApp\Handlers;
 
 use App\Domain\Task\Models\Task;
+use App\Domain\Task\Models\TaskSchedule;
 use App\Domain\Task\Models\TaskUpdate;
 use App\Domain\User\Models\User;
 use App\Domain\WhatsApp\Models\WaMedia;
@@ -145,6 +146,9 @@ class CommandHandler
         if ($cmd === 'REPORT TODAY' || $cmd === 'REPORT WEEK' || $cmd === 'REPORT') return $this->handleReport($manager, $cmd);
         if ($cmd === 'VERIFY') return $this->handleVerify($manager, $fullMessage);
         if ($cmd === 'REJECT') return $this->handleReject($manager, $fullMessage);
+        if ($cmd === 'SCHEDULE')    return $this->handleSchedule($manager, $fullMessage);
+        if ($cmd === 'SCHEDULES')   return $this->handleSchedules($manager);
+        if ($cmd === 'UNSCHEDULE')  return $this->handleUnschedule($manager, $fullMessage);
         if ($cmd === 'STATUS') {
             $parts = preg_split('/\s+/', trim($fullMessage), 2);
             if (count($parts) === 2 && !empty($parts[1])) {
@@ -1663,6 +1667,223 @@ class CommandHandler
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // PHASE 6 — RECURRING SCHEDULES (SCHEDULE / SCHEDULES / UNSCHEDULE)
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * SCHEDULE <name> <when> <task title>
+     *
+     * <when> can be:
+     *   daily                  → every day
+     *   mon / tue / ... / sun  → that single day each week
+     *   mon,wed,fri            → multiple days
+     *   weekdays               → Mon–Fri
+     *   weekends               → Sat–Sun
+     */
+    private function handleSchedule(User $manager, string $message): string
+    {
+        if (!$manager->isManager()) {
+            return "🚫 Only managers/admins can schedule recurring tasks.";
+        }
+
+        $parts = preg_split('/\s+/', trim($message), 4);
+        if (count($parts) < 4) {
+            return "❌ *Format:* SCHEDULE <name> <when> <task>\n\n"
+                 . "*<when> options:*\n"
+                 . "• `daily` — every day\n"
+                 . "• `mon` / `tue` / `wed` / `thu` / `fri` / `sat` / `sun`\n"
+                 . "• `mon,wed,fri` — multiple days\n"
+                 . "• `weekdays` — Mon–Fri\n"
+                 . "• `weekends` — Sat–Sun\n\n"
+                 . "*Examples:*\n"
+                 . "• SCHEDULE Parag daily send morning standup\n"
+                 . "• SCHEDULE Parag mon,wed,fri client follow-up calls\n"
+                 . "• SCHEDULE Rahul weekdays update inventory sheet";
+        }
+
+        $employeeName = $parts[1];
+        $scheduleSpec = strtolower($parts[2]);
+        $taskTitle    = $parts[3];
+
+        // Find candidates
+        $candidates = User::where('is_active', true)
+            ->where('id', '!=', $manager->id)
+            ->whereRaw('LOWER(name) LIKE ?', ['%' . strtolower($employeeName) . '%'])
+            ->get();
+
+        $assignable = $candidates->filter(fn($c) => $manager->canAssignTo($c))->values();
+
+        if ($assignable->isEmpty()) {
+            return "❌ Employee \"{$employeeName}\" not found in your team.\n\nReply *LIST* to see your team.";
+        }
+        if ($assignable->count() > 1) {
+            $msg = "🤔 Multiple matches for *{$employeeName}*:\n\n";
+            foreach ($assignable as $i => $c) {
+                $msg .= "*" . ($i + 1) . ".* {$c->name}\n";
+            }
+            return $msg . "\nUse the full name.";
+        }
+
+        $employee = $assignable->first();
+
+        // Parse schedule spec
+        $scheduleType = null;
+        $daysOfWeek   = null;
+
+        if ($scheduleSpec === 'daily') {
+            $scheduleType = 'daily';
+        } elseif ($scheduleSpec === 'weekdays') {
+            $scheduleType = 'weekly';
+            $daysOfWeek   = ['mon', 'tue', 'wed', 'thu', 'fri'];
+        } elseif (in_array($scheduleSpec, ['weekend', 'weekends'], true)) {
+            $scheduleType = 'weekly';
+            $daysOfWeek   = ['sat', 'sun'];
+        } elseif (str_contains($scheduleSpec, ',')) {
+            $scheduleType = 'weekly';
+            $daysOfWeek   = [];
+            foreach (explode(',', $scheduleSpec) as $d) {
+                $n = $this->normalizeDayName(trim($d));
+                if ($n) $daysOfWeek[] = $n;
+            }
+            if (empty($daysOfWeek)) {
+                return "❌ Invalid days. Use: mon, tue, wed, thu, fri, sat, sun";
+            }
+            $daysOfWeek = array_values(array_unique($daysOfWeek));
+        } else {
+            $n = $this->normalizeDayName($scheduleSpec);
+            if (!$n) {
+                return "❌ Invalid schedule keyword: \"{$scheduleSpec}\"\n\n"
+                     . "Use: daily, mon, tue, wed, thu, fri, sat, sun, weekdays, weekends, or comma-list.";
+            }
+            $scheduleType = 'weekly';
+            $daysOfWeek   = [$n];
+        }
+
+        $schedule = TaskSchedule::create([
+            'tenant_id'     => 'default',
+            'title'         => $taskTitle,
+            'assigned_by'   => $manager->id,
+            'assigned_to'   => $employee->id,
+            'schedule_type' => $scheduleType,
+            'days_of_week'  => $daysOfWeek,
+            'priority'      => 'medium',
+            'reward_points' => 50,
+            'is_active'     => true,
+        ]);
+
+        ActivityLog::record(
+            'schedule', 'create', 'success',
+            "📅 Schedule created by {$manager->name} for {$employee->name}: \"{$taskTitle}\"",
+            ['schedule_id' => $schedule->id, 'type' => $scheduleType, 'days' => $daysOfWeek]
+        );
+
+        $whenStr = $scheduleType === 'daily'
+            ? 'every day'
+            : implode(', ', array_map(fn($d) => ucfirst($d), $daysOfWeek));
+
+        return "✅ *Recurring Task Scheduled!*\n\n"
+             . "👤 For: {$employee->name}\n"
+             . "📋 " . substr($taskTitle, 0, 200) . "\n"
+             . "📅 When: {$whenStr}\n"
+             . "🆔 Schedule ID: S-" . substr($schedule->id, 0, 6) . "\n\n"
+             . "Bot will auto-create the task at 8 AM IST on matching days.\n"
+             . "_Reply *SCHEDULES* to list • *UNSCHEDULE S-xxx* to remove._";
+    }
+
+    /**
+     * SCHEDULES — list all active recurring schedules created by this manager.
+     */
+    private function handleSchedules(User $manager): string
+    {
+        if (!$manager->isManager()) {
+            return "🚫 Only managers/admins can view schedules.";
+        }
+
+        $schedules = TaskSchedule::with(['assignedTo'])
+            ->where('assigned_by', $manager->id)
+            ->where('is_active', true)
+            ->orderBy('created_at')
+            ->get();
+
+        if ($schedules->isEmpty()) {
+            return "📅 No active recurring schedules.\n\nCreate one with:\n*SCHEDULE <name> <when> <task>*";
+        }
+
+        $msg = "📅 *Your Active Schedules ({$schedules->count()})*\n\n";
+        foreach ($schedules as $i => $s) {
+            $num = $i + 1;
+            $when = $s->schedule_type === 'daily'
+                ? 'Daily'
+                : implode(', ', array_map(fn($d) => ucfirst($d), $s->days_of_week ?? []));
+            $msg .= "*{$num}. S-" . substr($s->id, 0, 6) . "* → {$s->assignedTo->name}\n";
+            $msg .= "   📋 " . substr($s->title, 0, 80) . (strlen($s->title) > 80 ? '…' : '') . "\n";
+            $msg .= "   📅 {$when}\n";
+            if ($s->last_dispatched_at) {
+                $msg .= "   ⏰ Last sent: " . $s->last_dispatched_at->diffForHumans() . "\n";
+            }
+            $msg .= "\n";
+        }
+        $msg .= "_Reply *UNSCHEDULE S-xxx* to remove a schedule._";
+        return $msg;
+    }
+
+    /**
+     * UNSCHEDULE S-xxx — deactivate a recurring schedule.
+     */
+    private function handleUnschedule(User $manager, string $message): string
+    {
+        if (!$manager->isManager()) {
+            return "🚫 Only managers/admins can remove schedules.";
+        }
+
+        $parts = preg_split('/\s+/', trim($message), 2);
+        if (count($parts) < 2) {
+            return "❌ Format: *UNSCHEDULE S-xxx*\n\nReply *SCHEDULES* to see your schedule IDs.";
+        }
+
+        $shortId = strtolower(str_replace('s-', '', $parts[1]));
+        $schedule = TaskSchedule::whereRaw('LOWER(id::text) LIKE ?', [$shortId . '%'])
+            ->first();
+
+        if (!$schedule) {
+            return "❌ Schedule not found: {$parts[1]}";
+        }
+
+        // Authority: creator or admin
+        if ($schedule->assigned_by !== $manager->id && $manager->role !== 'admin') {
+            return "🚫 You can only remove schedules you created.";
+        }
+
+        $schedule->update(['is_active' => false]);
+
+        ActivityLog::record(
+            'schedule', 'deactivate', 'success',
+            "🚫 Schedule S-" . substr($schedule->id, 0, 6) . " deactivated by {$manager->name}",
+            ['schedule_id' => $schedule->id]
+        );
+
+        return "🚫 *Schedule deactivated*\n\nS-" . substr($schedule->id, 0, 6)
+             . " will no longer auto-create tasks.\n📋 " . substr($schedule->title, 0, 100);
+    }
+
+    /**
+     * Normalize various day-name inputs (full name / abbreviation) to 3-letter lowercase.
+     */
+    private function normalizeDayName(string $input): ?string
+    {
+        $map = [
+            'monday' => 'mon', 'mon' => 'mon',
+            'tuesday' => 'tue', 'tue' => 'tue', 'tues' => 'tue',
+            'wednesday' => 'wed', 'wed' => 'wed',
+            'thursday' => 'thu', 'thu' => 'thu', 'thur' => 'thu', 'thurs' => 'thu',
+            'friday' => 'fri', 'fri' => 'fri',
+            'saturday' => 'sat', 'sat' => 'sat',
+            'sunday' => 'sun', 'sun' => 'sun',
+        ];
+        return $map[strtolower(trim($input))] ?? null;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // PHASE 3 — CONVERSATIONAL CHAT SESSION (CHAT <name> → CLOSE)
     // ════════════════════════════════════════════════════════════════════
 
@@ -1897,38 +2118,64 @@ class CommandHandler
     private function helpMessage(User $user): string
     {
         if ($user->isManager()) {
-            return "📋 *Manager Commands*\n\n"
-                 . "*ASSIGN <name> [task text]* — Start building a task\n"
-                 . "  💡 Then send: text, images, PDFs, Excel, Word, PPT (anything)\n"
-                 . "  💡 Last *DONE* — forwards everything to the employee as one task\n"
-                 . "  💡 *CANCEL* to abort\n\n"
-                 . "*ADD EMPLOYEE <name> <phone> <role>* — Add employee\n"
-                 . "*LIST* — Show team (basic)\n"
-                 . "*ALL* — Show team with task counts\n"
-                 . "*TEAM* — Team tree with counts\n"
-                 . "*STATUS <name>* — Detailed status with delays\n"
-                 . "*CANCEL T-xxx [reason]* — Cancel a task\n"
-                 . "*REASSIGN T-xxx <name>* — Move task to someone else\n"
-                 . "*REOPEN T-xxx [reason]* — Reopen completed task\n"
-                 . "*REPORT TODAY* / *REPORT WEEK* — Stats\n"
-                 . "*VERIFY T-xxx* / *REJECT T-xxx <reason>*\n\n"
-                 . "📊 *Quick filters:* URGENT • HIGH • TODAY • OVERDUE • PENDING\n\n"
-                 . "💬 *Chat:* CHAT <name> [+message]  •  REPLY <message>  •  CLOSE\n\n"
-                 . "Example:\nASSIGN Parag fix the homepage\n[image]\n[PDF]\nalso mobile responsive\nDONE";
+            return "📋 *Manager Commands*\n"
+                 . "━━━━━━━━━━━━━━━━━━\n\n"
+                 . "*📦 Assign Tasks*\n"
+                 . "• `ASSIGN <name> <task>` — start a task\n"
+                 . "• Then send text / image / PDF / Excel / Word / PPT / voice note\n"
+                 . "• Send *DONE* to finalize, *CANCEL* to abort\n"
+                 . "• ⏰ Auto-finalizes after 2 min idle\n\n"
+                 . "*📅 Recurring Schedules*\n"
+                 . "• `SCHEDULE <name> daily <task>` — every day\n"
+                 . "• `SCHEDULE <name> mon,wed,fri <task>` — specific days\n"
+                 . "• `SCHEDULE <name> weekdays <task>` — Mon-Fri\n"
+                 . "• `SCHEDULES` — list active schedules\n"
+                 . "• `UNSCHEDULE S-xxx` — remove a schedule\n\n"
+                 . "*👥 Team Info*\n"
+                 . "• `LIST` — basic team list\n"
+                 . "• `ALL` — team with task counts\n"
+                 . "• `TEAM` — team tree view\n"
+                 . "• `STATUS <name>` or just `<name>` — full employee status\n"
+                 . "• `REPORT TODAY` / `REPORT WEEK` — stats\n\n"
+                 . "*✅ Task Actions*\n"
+                 . "• `VERIFY T-xxx` — approve completed task\n"
+                 . "• `REJECT T-xxx <reason>` — reject\n"
+                 . "• `CANCEL T-xxx [reason]` — cancel\n"
+                 . "• `REASSIGN T-xxx <name>` — move task\n"
+                 . "• `REOPEN T-xxx [reason]` — reopen completed task\n\n"
+                 . "*📊 Quick Filters*\n"
+                 . "URGENT • HIGH • TODAY • OVERDUE • PENDING\n\n"
+                 . "*💬 Chat*\n"
+                 . "• `CHAT <name>` — open conversation (CLOSE to exit)\n"
+                 . "• `CHAT <name> <msg>` — one-shot DM\n"
+                 . "• `REPLY <msg>` — reply to last received chat\n\n"
+                 . "*👤 Add Employee*\n"
+                 . "`ADD EMPLOYEE <name> <phone> <role>`\n\n"
+                 . "💡 *Tip:* You can also chat naturally:\n"
+                 . "  _\"what is Parag doing?\"_ → status\n"
+                 . "  _\"please assign Rahul fix login\"_ → task";
         }
 
-        return "📋 *Employee Commands*\n\n"
-             . "*START* — Begin task\n"
-             . "*UPDATE <text>* — Send progress\n"
-             . "*COMPLETE* — Mark done\n"
-             . "*DELAY <reason>* — Report delay\n"
-             . "*ESCALATE <issue>* — Flag urgent\n"
-             . "*REOPEN T-xxx [reason]* — Reopen own completed task\n"
-             . "*STATUS* — View all my tasks\n"
-             . "*SCORE* — My APIX\n\n"
-             . "📊 *Quick filters:* URGENT • HIGH • TODAY • OVERDUE • PENDING\n\n"
-             . "💬 *Chat:* CHAT <name> [+message]  •  REPLY <message>  •  CLOSE\n\n"
-             . "💡 Bot will always show a numbered list — reply *START 1*, *COMPLETE 2*, or just *1*, *2*, etc.";
+        return "📋 *Employee Commands*\n"
+             . "━━━━━━━━━━━━━━━━━━\n\n"
+             . "*🎯 Task Lifecycle*\n"
+             . "• `START` — begin a task\n"
+             . "• `UPDATE <text>` — send progress\n"
+             . "• `COMPLETE` — mark done\n"
+             . "• `DELAY <reason>` — report delay\n"
+             . "• `ESCALATE <issue>` — flag urgent\n"
+             . "• `REOPEN T-xxx [reason]` — reopen your completed task\n\n"
+             . "*📊 Info*\n"
+             . "• `STATUS` — view all your tasks\n"
+             . "• `SCORE` — your APIX score\n\n"
+             . "*📊 Quick Filters*\n"
+             . "URGENT • HIGH • TODAY • OVERDUE • PENDING\n\n"
+             . "*💬 Chat*\n"
+             . "• `CHAT <name>` — open conversation (CLOSE to exit)\n"
+             . "• `CHAT <name> <msg>` — one-shot DM\n"
+             . "• `REPLY <msg>` — reply to last received chat\n\n"
+             . "💡 *Tip:* When you have multiple tasks, the bot shows a numbered list.\n"
+             . "Reply with the number, e.g. *1* or *COMPLETE 2*.";
     }
 
     private function getActiveTask(User $user): ?Task

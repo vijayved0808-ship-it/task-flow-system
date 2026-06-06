@@ -100,6 +100,22 @@ class SystemController extends Controller
     }
 
     /**
+     * POST /api/system/run/dispatch-schedules
+     */
+    public function runDispatchSchedules(Request $request): JsonResponse
+    {
+        if ($r = $this->authorize($request)) return $r;
+
+        $exitCode = Artisan::call('schedules:dispatch');
+        return response()->json([
+            'command'   => 'schedules:dispatch',
+            'exit_code' => $exitCode,
+            'output'    => trim(Artisan::output()),
+            'ran_at'    => now()->toIso8601String(),
+        ]);
+    }
+
+    /**
      * GET /api/system/health — public, no secret required.
      * Returns DB status + media + task counts so external monitoring works.
      */
