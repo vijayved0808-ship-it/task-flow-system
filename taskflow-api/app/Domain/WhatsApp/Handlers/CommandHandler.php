@@ -467,6 +467,11 @@ class CommandHandler
         $task = Task::where('id', 'LIKE', $taskId . '%')->first();
         if (!$task) return "❌ Task not found: {$parts[1]}";
 
+        // Idempotency
+        if (in_array($task->status, ['rejected', 'cancelled', 'verified'], true)) {
+            return "ℹ️ Task is already *{$task->status}*. No action taken.";
+        }
+
         $task->update(['status' => 'rejected']);
 
         if ($task->assignedTo) {
@@ -571,6 +576,15 @@ class CommandHandler
         if (isset($resolve['reply'])) return $resolve['reply'];
         $task = $resolve['task'];
 
+        // Idempotency check
+        $freshStatus = Task::where('id', $task->id)->value('status');
+        if ($freshStatus === 'in_progress') {
+            return "ℹ️ Task is already *in_progress*. Keep working — send *UPDATE* or *COMPLETE*.\n\n📋 " . $task->title;
+        }
+        if (in_array($freshStatus, ['completed', 'verified', 'cancelled', 'rejected'], true)) {
+            return "ℹ️ Task is already *{$freshStatus}*. Cannot start.\n\n📋 " . $task->title;
+        }
+
         $task->update(['status' => 'in_progress']);
         $this->logUpdate($task, $user, 'start', $message);
 
@@ -605,6 +619,13 @@ class CommandHandler
         $resolve = $this->resolveTaskForCommand($user, 'COMPLETE', $message);
         if (isset($resolve['reply'])) return $resolve['reply'];
         $task = $resolve['task'];
+
+        // Idempotency — re-fetch fresh status from DB to defeat race conditions
+        // (e.g. concurrent webhook retries that beat our dedup cache).
+        $freshStatus = Task::where('id', $task->id)->value('status');
+        if (in_array($freshStatus, ['completed', 'verified', 'cancelled', 'rejected'], true)) {
+            return "ℹ️ Task is already *{$freshStatus}*. No action taken.\n\n📋 " . $task->title;
+        }
 
         $task->update(['status' => 'completed', 'completed_at' => now()]);
         $this->logUpdate($task, $user, 'complete', $message, $waMessageId);

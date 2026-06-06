@@ -11,6 +11,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 
 class ProcessInboundWhatsApp implements ShouldQueue
@@ -37,6 +38,23 @@ class ProcessInboundWhatsApp implements ShouldQueue
             $phone     = $message['from'];
             $msgType   = $message['type'] ?? 'text';
             $messageId = $message['id'];
+
+            // ── WEBHOOK DEDUPLICATION ──
+            // Meta retries webhooks on slow ACK (common on Render free tier cold starts).
+            // Use the message-id as a 24-hour dedup key. First arrival wins; retries skip.
+            if ($messageId) {
+                $dedupKey = "wa_msg_dedup:{$messageId}";
+                if (Cache::has($dedupKey)) {
+                    Log::info("Duplicate webhook skipped", ['message_id' => $messageId]);
+                    ActivityLog::record(
+                        'whatsapp_in', 'duplicate_skipped', 'info',
+                        "⏭ Duplicate webhook skipped (message {$messageId} already processed)",
+                        ['message_id' => $messageId]
+                    );
+                    return;
+                }
+                Cache::put($dedupKey, true, now()->addHours(24));
+            }
 
             // ── Extract text + media payload from any message type ──
             $text          = '';
