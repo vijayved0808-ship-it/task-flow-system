@@ -554,7 +554,7 @@ class CommandHandler
 
         if ($activeTasks->isNotEmpty()) {
             $msg .= "\n*All active tasks (with delay):*\n";
-            foreach ($activeTasks->take(10) as $i => $t) {
+            foreach ($activeTasks as $i => $t) {
                 $num = $i + 1;
                 $msg .= "{$num}. " . $t->title . "\n";
                 $msg .= "   _Status: {$t->status}_";
@@ -567,11 +567,9 @@ class CommandHandler
                 }
                 $msg .= "\n";
             }
-            if ($activeTasks->count() > 10) {
-                $msg .= "_…and " . ($activeTasks->count() - 10) . " more_\n";
-            }
         }
-        return $msg;
+        // Split into multiple WhatsApp messages if too long (4096 char limit)
+        return $this->sendChunksAndReturnLast($manager->phone, rtrim($msg));
     }
 
     private function handleStart(User $user, string $message): string
@@ -692,19 +690,98 @@ class CommandHandler
         return "📊 *Your APIX Score*\n\n🏆 {$score->apix_score} — {$band}";
     }
 
+    /**
+     * Split a long message into chunks under WhatsApp's 4096-char limit and send all but the last
+     * directly via the WhatsApp service. Return the last chunk so ProcessInboundWhatsApp sends it
+     * (preserving correct visual order in the recipient's chat).
+     *
+     * If the message fits in one chunk, just returns it unchanged.
+     */
+    private function sendChunksAndReturnLast(string $phone, string $message, int $maxLen = 3500): string
+    {
+        if (strlen($message) <= $maxLen) {
+            return $message; // single message, normal flow
+        }
+
+        $chunks = $this->splitMessage($message, $maxLen);
+        if (count($chunks) === 1) return $chunks[0];
+
+        // Send all but last directly (these appear first in WhatsApp)
+        $last = array_pop($chunks);
+        foreach ($chunks as $idx => $chunk) {
+            $continued = "📋 *(continued " . ($idx + 2) . "/" . (count($chunks) + 1) . ")*\n\n";
+            $body = $idx === 0 ? $chunk : $continued . $chunk;
+            $this->wa->sendMessage($phone, $body);
+        }
+        // Add continued marker to last chunk too
+        $totalParts = count($chunks) + 1;
+        $last = "📋 *(continued {$totalParts}/{$totalParts})*\n\n" . $last;
+        return $last;
+    }
+
+    /**
+     * Split text into chunks no larger than $maxLen, breaking at newlines when possible.
+     */
+    private function splitMessage(string $msg, int $maxLen): array
+    {
+        if (strlen($msg) <= $maxLen) return [$msg];
+
+        $lines  = explode("\n", $msg);
+        $chunks = [];
+        $current = '';
+
+        foreach ($lines as $line) {
+            // Single line longer than maxLen → hard-split mid-line
+            if (strlen($line) > $maxLen) {
+                if ($current !== '') {
+                    $chunks[] = rtrim($current);
+                    $current = '';
+                }
+                foreach (str_split($line, $maxLen - 50) as $piece) {
+                    $chunks[] = $piece;
+                }
+                continue;
+            }
+
+            if (strlen($current) + strlen($line) + 1 > $maxLen && $current !== '') {
+                $chunks[] = rtrim($current);
+                $current = $line . "\n";
+            } else {
+                $current .= $line . "\n";
+            }
+        }
+        if (trim($current) !== '') $chunks[] = rtrim($current);
+        return $chunks;
+    }
+
     private function handleStatus(User $user): string
     {
         $tasks = Task::where('assigned_to', $user->id)
-            ->whereNotIn('status', ['completed', 'verified'])->limit(5)->get();
+            ->whereNotIn('status', ['completed', 'verified', 'cancelled', 'rejected'])
+            ->orderByRaw("CASE status WHEN 'in_progress' THEN 1 WHEN 'accepted' THEN 2 WHEN 'waiting' THEN 3 WHEN 'assigned' THEN 4 ELSE 5 END")
+            ->orderBy('due_date')
+            ->get();
 
         if ($tasks->isEmpty()) return "✅ No pending tasks! Great work.";
 
-        $msg = "📋 *Your Active Tasks*\n\n";
+        $count = $tasks->count();
+        $header = "📋 *Your Active Tasks ({$count})*\n\n";
+
+        // Build full message — no title truncation
+        $msg = $header;
         foreach ($tasks as $i => $task) {
+            $num = $i + 1;
             $due = $task->due_date ? $task->due_date->format('d M h:i A') : 'No deadline';
-            $msg .= ($i + 1) . ". {$task->title}\n   Status: {$task->status} | Due: {$due}\n\n";
+            $msg .= "*{$num}.* " . $task->title . "\n";
+            $msg .= "   _Status:_ {$task->status}  •  _Due:_ {$due}";
+            if ($task->due_date && $task->due_date->isPast()) {
+                $msg .= " ⏰";
+            }
+            $msg .= "\n\n";
         }
-        return trim($msg);
+
+        // Split into multiple WhatsApp messages if too long (4096 char limit)
+        return $this->sendChunksAndReturnLast($user->phone, rtrim($msg));
     }
 
     private function handleUnknown(User $user, string $message, ?string $waMessageId): string
