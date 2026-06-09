@@ -3,15 +3,15 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg: #080c14;
-  --surface: #0e1420;
-  --surface2: #131928;
-  --border: rgba(255,255,255,0.06);
-  --border2: rgba(255,255,255,0.10);
-  --text: #e2e8f0;
-  --text2: rgba(226,232,240,0.6);
-  --text3: rgba(226,232,240,0.35);
-  --accent: #22d3ee;
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --surface2: #f1f5f9;
+  --border: #e2e8f0;
+  --border2: #cbd5e1;
+  --text: #0f172a;
+  --text2: rgba(15,23,42,0.65);
+  --text3: rgba(15,23,42,0.5);
+  --accent: #0891b2;
   --accent2: #10b981;
   --accent3: #f59e0b;
   --danger: #ef4444;
@@ -19,12 +19,16 @@
   --radius-lg: 12px;
 }
 
-html, body, #root { height: 100%; background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; }
+html, body, #root { height: 100%; background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased; }
 
-::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+::-webkit-scrollbar-thumb { background: rgba(15,23,42,0.15); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(15,23,42,0.3); }
 
-button { font-family: inherit; cursor: pointer; }
+button { font-family: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent; }
 input, select, textarea { font-family: inherit; }
 a { color: inherit; text-decoration: none; }
+
+/* Smooth touch feel */
+* { -webkit-tap-highlight-color: transparent; }
